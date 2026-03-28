@@ -1,0 +1,25 @@
+name: business-policy-compliance-customer-resolution
+version: 1.0.0
+description: >-
+  A Business Policy Compliance and Customer Resolution environment for policy-aware
+  email operations under uncertainty. Agents must route, prioritize, escalate,
+  request clarification, and draft responses while obeying explicit refund,
+  SLA, legal-risk, VIP, and suspended-account policies.
+entrypoint: business_policy_env.server:app
+framework: fastapi
+language: python
+port: 7860
+endpoints:
+  health: /health
+  reset: /reset
+  step: /step
+  state: /state
+baseline:
+  command: python baseline.py --agent rule
+tasks:
+  - name: easy
+    objective: Single-turn tickets with clear policy constraints.
+  - name: medium
+    objective: Ambiguous tickets that require request_info before resolution.
+  - name: hard
+    objective: Multi-turn threads with temporal pressure, policy rules, and history-aware responses.
