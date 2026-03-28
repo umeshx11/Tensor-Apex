@@ -42,6 +42,7 @@ FRAUD_SIGNALS = [
     "multiple cards",
     "bank reversal",
     "identity theft",
+    "contradict",
 ]
 
 RESOLUTION_ACTION_TYPES = {"categorize", "set_priority", "draft_response", "escalate", "mark_spam"}
@@ -61,7 +62,10 @@ def policy_rules_for(version: PolicyVersion) -> list[str]:
 
 def has_fraud_indicators(snapshot: TicketSnapshot) -> bool:
     body_text = " ".join(message.body.lower() for message in snapshot.thread)
-    if any(flag in {"fraud_risk", "ato_watch", "chargeback_risk"} for flag in snapshot.account_flags):
+    if any(
+        flag in {"fraud_risk", "ato_watch", "chargeback_risk", "no_cancellation_on_record"}
+        for flag in snapshot.account_flags
+    ):
         return True
     return any(signal in body_text for signal in FRAUD_SIGNALS)
 
@@ -93,7 +97,7 @@ def compute_policy_expectations(
         expectations["min_priority"] = "urgent"
         expectations["triggered_rules"].append("sla_breach")
 
-    if "lawsuit" in body_text or "legal action" in body_text or "lawyer" in body_text:
+    if "lawsuit" in body_text or "legal action" in body_text or "lawyer" in body_text or "counsel" in body_text:
         expectations["requires_escalation"] = True
         expectations["triggered_rules"].append("legal_threat")
 

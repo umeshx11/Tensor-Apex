@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import random
 import re
 from dataclasses import dataclass, field
@@ -46,12 +47,18 @@ class ScenarioTemplate:
     suspended_account: bool = False
     expected_flag_fraud: bool = False
     fraud_keywords: list[str] = field(default_factory=list)
-    policy_version: PolicyVersion = "v1"
+    refund_range: tuple[float, float] | None = None
+    age_range: tuple[float, float] | None = None
+    policy_version: PolicyVersion | Literal["random"] = "v1"
     max_steps: int = 6
     objective: str | None = None
     expected_escalation_reason: str | None = None
     thread_directions: list[Literal["customer", "agent", "system"]] = field(default_factory=list)
     visible_problem_type: str | None = None
+    partial_observability: bool = False
+    hidden_account_flag_count: int = 0
+    policy_transition_step: int | None = None
+    policy_transition_to: PolicyVersion | None = None
 
 
 EASY_TEMPLATES: list[ScenarioTemplate] = [
@@ -809,7 +816,546 @@ HARD_TEMPLATES: list[ScenarioTemplate] = [
 ]
 
 
-ALL_TEMPLATES: tuple[ScenarioTemplate, ...] = tuple(EASY_TEMPLATES + MEDIUM_TEMPLATES + HARD_TEMPLATES)
+EXTENDED_EASY_TEMPLATES: list[ScenarioTemplate] = [
+    ScenarioTemplate(
+        scenario_id="easy_cross_domain_credit_request",
+        title="Service outage with billing-credit request",
+        subject="Outage credit for yesterday's dashboard downtime",
+        difficulty="easy",
+        sender_tier="vip",
+        account_flags=[],
+        refund_amount=240.0,
+        age_hours=20,
+        thread_bodies=["Our dashboard was down for hours yesterday and we need a billing credit for the disruption."],
+        expected_category="billing",
+        expected_priority="high",
+        expected_escalation=False,
+        requires_request_info=False,
+        request_info_first_required=False,
+        response_keywords=[],
+        history_keywords=[],
+        clarification_keywords=[],
+        refund_range=(180.0, 320.0),
+        age_range=(10.0, 28.0),
+        visible_problem_type="billing",
+        max_steps=5,
+    ),
+    ScenarioTemplate(
+        scenario_id="easy_standard_return_label",
+        title="Straightforward return label request",
+        subject="Need a return label for the wrong headset size",
+        difficulty="easy",
+        sender_tier="standard",
+        account_flags=[],
+        refund_amount=None,
+        age_hours=15,
+        thread_bodies=["The headset size was wrong and I just need a return label so I can send it back."],
+        expected_category="returns",
+        expected_priority="medium",
+        expected_escalation=False,
+        requires_request_info=False,
+        request_info_first_required=False,
+        response_keywords=[],
+        history_keywords=[],
+        clarification_keywords=[],
+        age_range=(8.0, 24.0),
+        visible_problem_type="returns",
+        max_steps=5,
+    ),
+    ScenarioTemplate(
+        scenario_id="easy_premier_same_day_question",
+        title="Premier same-day onboarding guidance",
+        subject="Need same-day approval workflow guidance",
+        difficulty="easy",
+        sender_tier="premier",
+        account_flags=[],
+        refund_amount=None,
+        age_hours=8,
+        thread_bodies=["We are a premier customer and need someone to guide us through approval workflows today."],
+        expected_category="customer_success",
+        expected_priority="high",
+        expected_escalation=False,
+        requires_request_info=False,
+        request_info_first_required=False,
+        response_keywords=[],
+        history_keywords=[],
+        clarification_keywords=[],
+        policy_version="v2",
+        age_range=(4.0, 18.0),
+        visible_problem_type="customer_success",
+        max_steps=5,
+    ),
+    ScenarioTemplate(
+        scenario_id="easy_spam_with_legal_bait",
+        title="Spam message posing as a legal notice",
+        subject="Urgent legal review required click for settlement",
+        difficulty="easy",
+        sender_tier="standard",
+        account_flags=[],
+        refund_amount=None,
+        age_hours=2,
+        thread_bodies=[
+            "Click this external form to avoid legal trouble and unlock a guaranteed settlement for your account."
+        ],
+        expected_category="spam",
+        expected_priority="low",
+        expected_escalation=False,
+        requires_request_info=False,
+        request_info_first_required=False,
+        response_keywords=[],
+        history_keywords=[],
+        clarification_keywords=[],
+        visible_problem_type="spam",
+        max_steps=5,
+    ),
+]
+
+
+EXTENDED_MEDIUM_TEMPLATES: list[ScenarioTemplate] = [
+    ScenarioTemplate(
+        scenario_id="medium_vip_downgrade_dispute",
+        title="Customer disputes account tier downgrade",
+        subject="Why was our VIP support tier removed?",
+        difficulty="medium",
+        sender_tier="standard",
+        account_flags=["vip_dispute"],
+        refund_amount=None,
+        age_hours=18,
+        thread_bodies=["We were told we are no longer VIP, but our contract says we should be. Please fix this."],
+        expected_category="customer_success",
+        expected_priority="medium",
+        expected_escalation=False,
+        requires_request_info=True,
+        request_info_first_required=True,
+        response_keywords=["support tier", "contract", "review"],
+        history_keywords=["vip", "contract"],
+        clarification_keywords=["contract", "renewal", "account"],
+        clarification_body=(
+            "Our renewal invoice should include premium support and the downgrade happened after "
+            "that change."
+        ),
+        age_range=(12.0, 30.0),
+        max_steps=7,
+    ),
+    ScenarioTemplate(
+        scenario_id="medium_cross_domain_billing_bug",
+        title="App failure tied to a disputed charge",
+        subject="App stopped working right after the add-on charge",
+        difficulty="medium",
+        sender_tier="vip",
+        account_flags=[],
+        refund_amount=260.0,
+        age_hours=27,
+        thread_bodies=["The app broke right after we were charged for the add-on and I need this sorted out."],
+        expected_category="technical_support",
+        expected_priority="high",
+        expected_escalation=False,
+        requires_request_info=True,
+        request_info_first_required=True,
+        response_keywords=["app", "billing", "investigate"],
+        history_keywords=["charge", "broke"],
+        clarification_keywords=["error", "screen", "charge"],
+        clarification_body=(
+            "The charge was expected; the real issue is that the desktop app crashes after the "
+            "add-on unlocks."
+        ),
+        refund_range=(180.0, 320.0),
+        age_range=(18.0, 36.0),
+        max_steps=7,
+    ),
+    ScenarioTemplate(
+        scenario_id="medium_refund_or_credit_review",
+        title="Credit note versus refund ambiguity",
+        subject="Need the right fix for the duplicate invoice",
+        difficulty="medium",
+        sender_tier="standard",
+        account_flags=[],
+        refund_amount=480.0,
+        age_hours=34,
+        thread_bodies=["We were billed twice and need the right correction applied to the account."],
+        expected_category="billing",
+        expected_priority="medium",
+        expected_escalation=False,
+        requires_request_info=True,
+        request_info_first_required=True,
+        response_keywords=["invoice", "credit", "refund"],
+        history_keywords=["twice", "correction"],
+        clarification_keywords=["credit", "refund", "invoice"],
+        clarification_body="A refund is fine, but a credit memo on the current invoice would also solve it for us.",
+        refund_range=(320.0, 520.0),
+        age_range=(24.0, 44.0),
+        max_steps=7,
+    ),
+    ScenarioTemplate(
+        scenario_id="medium_migration_or_refund",
+        title="Cross-domain migration delay with refund threat",
+        subject="Migration failed and we may need our money back",
+        difficulty="medium",
+        sender_tier="premier",
+        account_flags=[],
+        refund_amount=540.0,
+        age_hours=21,
+        thread_bodies=["Our migration failed and I need to know whether you can fix it or refund the service."],
+        expected_category="technical_support",
+        expected_priority="high",
+        expected_escalation=False,
+        requires_request_info=True,
+        request_info_first_required=True,
+        response_keywords=["migration", "fix", "timeline"],
+        history_keywords=["refund", "failed"],
+        clarification_keywords=["error", "migration", "refund"],
+        clarification_body=(
+            "We still want the migration completed today; if that is impossible we would discuss "
+            "a refund later."
+        ),
+        refund_range=(500.0, 760.0),
+        age_range=(16.0, 30.0),
+        policy_version="random",
+        max_steps=7,
+    ),
+    ScenarioTemplate(
+        scenario_id="medium_false_legal_subject",
+        title="Alarmist subject with ordinary billing body",
+        subject="Legal escalation if invoice is wrong",
+        difficulty="medium",
+        sender_tier="standard",
+        account_flags=[],
+        refund_amount=None,
+        age_hours=16,
+        thread_bodies=["Ignore my dramatic subject line, I only need help understanding a tax line on the invoice."],
+        expected_category="billing",
+        expected_priority="medium",
+        expected_escalation=False,
+        requires_request_info=True,
+        request_info_first_required=True,
+        response_keywords=["invoice", "tax", "explain"],
+        history_keywords=["subject line"],
+        clarification_keywords=["invoice", "line item", "tax"],
+        clarification_body="It is the tax adjustment on invoice INV-441 that I need explained.",
+        max_steps=7,
+    ),
+    ScenarioTemplate(
+        scenario_id="medium_account_lock_or_chargeback",
+        title="Account lock could be fraud or billing dispute",
+        subject="Locked out after bank reversal notice",
+        difficulty="medium",
+        sender_tier="standard",
+        account_flags=["chargeback_risk"],
+        refund_amount=None,
+        age_hours=25,
+        thread_bodies=["Our account locked right after a bank reversal notice and I do not know what happened."],
+        expected_category="billing",
+        expected_priority="medium",
+        expected_escalation=False,
+        requires_request_info=True,
+        request_info_first_required=True,
+        response_keywords=["review", "account", "chargeback"],
+        history_keywords=["bank reversal", "locked"],
+        clarification_keywords=["chargeback", "card", "bank"],
+        clarification_body="The bank reversed a subscription payment and now the billing console is locked.",
+        expected_flag_fraud=True,
+        fraud_keywords=["chargeback", "bank reversal"],
+        policy_version="v2",
+        partial_observability=True,
+        hidden_account_flag_count=1,
+        max_steps=7,
+    ),
+    ScenarioTemplate(
+        scenario_id="medium_snooze_sla_trap",
+        title="Customer asks for delay near SLA boundary",
+        subject="Can this wait until next week?",
+        difficulty="medium",
+        sender_tier="standard",
+        account_flags=[],
+        refund_amount=None,
+        age_hours=68,
+        thread_bodies=[
+            "I know this invoice problem is open, but can you just wait until next week before "
+            "handling it?"
+        ],
+        expected_category="billing",
+        expected_priority="medium",
+        expected_escalation=False,
+        requires_request_info=True,
+        request_info_first_required=True,
+        response_keywords=["timeline", "invoice", "today"],
+        history_keywords=["wait", "next week"],
+        clarification_keywords=["invoice", "deadline", "timeline"],
+        clarification_body=(
+            "I can send the invoice number today, but I still need to understand the charge "
+            "before next week."
+        ),
+        age_range=(66.0, 71.0),
+        max_steps=7,
+    ),
+    ScenarioTemplate(
+        scenario_id="medium_contract_or_outage_credit",
+        title="Contract dispute mixed with service credit ask",
+        subject="Need help with the contract and outage credit",
+        difficulty="medium",
+        sender_tier="vip",
+        account_flags=[],
+        refund_amount=300.0,
+        age_hours=29,
+        thread_bodies=["We need help with our contract and the outage credit from yesterday."],
+        expected_category="customer_success",
+        expected_priority="high",
+        expected_escalation=False,
+        requires_request_info=True,
+        request_info_first_required=True,
+        response_keywords=["contract", "credit", "review"],
+        history_keywords=["outage", "contract"],
+        clarification_keywords=["contract", "credit", "plan"],
+        clarification_body=(
+            "The real blocker is that our plan terms changed unexpectedly, and the outage credit "
+            "is secondary."
+        ),
+        refund_range=(220.0, 420.0),
+        max_steps=7,
+    ),
+]
+
+
+EXTENDED_HARD_TEMPLATES: list[ScenarioTemplate] = [
+    ScenarioTemplate(
+        scenario_id="hard_concurrent_violations",
+        title="Legal threat, high refund, and fraud signals in one ticket",
+        subject="Unauthorized duplicate charge and legal escalation",
+        difficulty="hard",
+        sender_tier="premier",
+        account_flags=["fraud_risk"],
+        refund_amount=920.0,
+        age_hours=86,
+        thread_bodies=[
+            "We found an unauthorized duplicate charge for $920 on a newly added card.",
+            "If this is not escalated today our legal counsel will get involved.",
+            "Please open a fraud review and confirm the billing escalation immediately.",
+        ],
+        expected_category="billing",
+        expected_priority="urgent",
+        expected_escalation=True,
+        requires_request_info=False,
+        request_info_first_required=False,
+        response_keywords=["fraud", "escalated", "duplicate charge", "review"],
+        history_keywords=["unauthorized", "legal counsel", "today"],
+        clarification_keywords=[],
+        expected_flag_fraud=True,
+        fraud_keywords=["unauthorized", "newly added card", "fraud review"],
+        expected_escalation_reason="Policy escalation required by legal pressure and high-value billing risk.",
+        refund_range=(860.0, 1100.0),
+        age_range=(80.0, 104.0),
+        policy_version="v2",
+        partial_observability=True,
+        hidden_account_flag_count=1,
+        max_steps=8,
+    ),
+    ScenarioTemplate(
+        scenario_id="hard_snooze_sla_race",
+        title="Customer-requested delay crosses urgent SLA boundary",
+        subject="Can we hold this invoice case for six more hours?",
+        difficulty="hard",
+        sender_tier="standard",
+        account_flags=[],
+        refund_amount=None,
+        age_hours=68,
+        thread_bodies=[
+            "This invoice dispute has been open for a while, but can you snooze it for six "
+            "hours until our finance lead returns?",
+            "I still need a real answer as soon as possible after that.",
+        ],
+        expected_category="billing",
+        expected_priority="medium",
+        expected_escalation=False,
+        requires_request_info=False,
+        request_info_first_required=False,
+        response_keywords=["invoice", "review", "today"],
+        history_keywords=["finance lead", "snooze", "open for a while"],
+        clarification_keywords=[],
+        age_range=(67.0, 71.0),
+        max_steps=8,
+    ),
+    ScenarioTemplate(
+        scenario_id="hard_policy_shift_fraud_upgrade",
+        title="Policy version upgrades mid-episode and adds fraud requirement",
+        subject="Premier account with suspicious card activity",
+        difficulty="hard",
+        sender_tier="premier",
+        account_flags=["fraud_risk"],
+        refund_amount=320.0,
+        age_hours=18,
+        thread_bodies=[
+            "We noticed suspicious card activity after a failed top-up and need help restoring access.",
+            "This is for our premier workspace and we need next steps today.",
+        ],
+        expected_category="billing",
+        expected_priority="high",
+        expected_escalation=False,
+        requires_request_info=False,
+        request_info_first_required=False,
+        response_keywords=["fraud", "review", "today", "account"],
+        history_keywords=["suspicious card", "premier workspace"],
+        clarification_keywords=[],
+        expected_flag_fraud=True,
+        fraud_keywords=["suspicious card", "failed top-up"],
+        policy_version="v1",
+        policy_transition_step=3,
+        policy_transition_to="v2",
+        partial_observability=True,
+        hidden_account_flag_count=1,
+        max_steps=8,
+    ),
+    ScenarioTemplate(
+        scenario_id="hard_contradictory_claim",
+        title="Customer claim contradicts account records",
+        subject="Refund the cancelled order you still shipped",
+        difficulty="hard",
+        sender_tier="standard",
+        account_flags=["no_cancellation_on_record"],
+        refund_amount=300.0,
+        age_hours=40,
+        thread_bodies=[
+            "I was charged $300 for an order I cancelled and I want the refund now.",
+            "Your records are wrong because the item should never have shipped.",
+        ],
+        expected_category="billing",
+        expected_priority="medium",
+        expected_escalation=False,
+        requires_request_info=False,
+        request_info_first_required=False,
+        response_keywords=["review", "order", "investigate"],
+        history_keywords=["cancelled", "shipped"],
+        clarification_keywords=[],
+        expected_flag_fraud=True,
+        fraud_keywords=["cancelled", "records are wrong", "shipped"],
+        policy_version="v2",
+        partial_observability=True,
+        hidden_account_flag_count=1,
+        max_steps=8,
+    ),
+    ScenarioTemplate(
+        scenario_id="hard_cross_domain_legal_outage",
+        title="Technical outage becomes legal and billing risk",
+        subject="Outage losses and invoice dispute need urgent review",
+        difficulty="hard",
+        sender_tier="vip",
+        account_flags=[],
+        refund_amount=610.0,
+        age_hours=76,
+        thread_bodies=[
+            "Our production workflow was down and the invoice still charged us in full.",
+            "We already followed up twice and need the outage credit corrected immediately.",
+            "If this keeps dragging on our legal team will review the contract impact.",
+        ],
+        expected_category="legal",
+        expected_priority="urgent",
+        expected_escalation=True,
+        requires_request_info=False,
+        request_info_first_required=False,
+        response_keywords=["outage", "invoice", "escalated", "review"],
+        history_keywords=["followed up twice", "legal team", "contract"],
+        clarification_keywords=[],
+        legal_language=True,
+        expected_escalation_reason="Customer mentioned legal action.",
+        refund_range=(560.0, 760.0),
+        age_range=(72.0, 96.0),
+        max_steps=8,
+    ),
+    ScenarioTemplate(
+        scenario_id="hard_hidden_flag_dispute",
+        title="Fraud dispute with partially hidden account risk flags",
+        subject="Why was our account frozen after these card updates?",
+        difficulty="hard",
+        sender_tier="standard",
+        account_flags=["fraud_risk", "chargeback_risk"],
+        refund_amount=None,
+        age_hours=52,
+        thread_bodies=[
+            "Our account froze after we updated payment cards and saw several reversals in the dashboard.",
+            "We need to know whether this is fraud review or a billing issue.",
+        ],
+        expected_category="billing",
+        expected_priority="medium",
+        expected_escalation=False,
+        requires_request_info=False,
+        request_info_first_required=False,
+        response_keywords=["review", "fraud", "billing"],
+        history_keywords=["payment cards", "reversals"],
+        clarification_keywords=[],
+        expected_flag_fraud=True,
+        fraud_keywords=["reversals", "payment cards"],
+        policy_version="v2",
+        partial_observability=True,
+        hidden_account_flag_count=1,
+        max_steps=8,
+    ),
+    ScenarioTemplate(
+        scenario_id="hard_premier_migration_with_refund_pressure",
+        title="Premier migration issue with refund pressure and same-day rule",
+        subject="Migration broke and we may need a same-day refund decision",
+        difficulty="hard",
+        sender_tier="premier",
+        account_flags=[],
+        refund_amount=740.0,
+        age_hours=28,
+        thread_bodies=[
+            "Our enterprise migration failed halfway through and we already lost a full day.",
+            "If you cannot recover it today we need a refund decision for the $740 service block.",
+            "Please confirm whether this is being escalated right now.",
+        ],
+        expected_category="technical_support",
+        expected_priority="high",
+        expected_escalation=True,
+        requires_request_info=False,
+        request_info_first_required=False,
+        response_keywords=["migration", "today", "escalated", "refund"],
+        history_keywords=["lost a full day", "right now"],
+        clarification_keywords=[],
+        expected_escalation_reason="Refund exceeds $500.",
+        policy_version="v2",
+        refund_range=(680.0, 860.0),
+        age_range=(20.0, 40.0),
+        max_steps=8,
+    ),
+    ScenarioTemplate(
+        scenario_id="hard_billing_technical_contract_precedence",
+        title="Billing, technical, and contract signals with precedence rules",
+        subject="Contract breach claim after admin lockout and duplicate charges",
+        difficulty="hard",
+        sender_tier="vip",
+        account_flags=["suspended"],
+        refund_amount=830.0,
+        age_hours=89,
+        thread_bodies=[
+            "Our admins were locked out after duplicate renewal charges posted to the account.",
+            "The contract guarantees access and this suspension is causing material damage.",
+            "We need billing, access restoration, and an urgent escalation path today.",
+        ],
+        expected_category="billing",
+        expected_priority="urgent",
+        expected_escalation=True,
+        requires_request_info=False,
+        request_info_first_required=False,
+        response_keywords=["billing", "restore", "escalated", "contract"],
+        history_keywords=["locked out", "duplicate renewal", "today"],
+        clarification_keywords=[],
+        legal_language=True,
+        suspended_account=True,
+        expected_escalation_reason="Policy escalation required by legal and high-value billing risk.",
+        refund_range=(760.0, 980.0),
+        age_range=(82.0, 102.0),
+        max_steps=8,
+    ),
+]
+
+
+ALL_TEMPLATES: tuple[ScenarioTemplate, ...] = tuple(
+    EASY_TEMPLATES
+    + EXTENDED_EASY_TEMPLATES
+    + MEDIUM_TEMPLATES
+    + EXTENDED_MEDIUM_TEMPLATES
+    + HARD_TEMPLATES
+    + EXTENDED_HARD_TEMPLATES
+)
 TEMPLATE_REGISTRY: dict[str, ScenarioTemplate] = {template.scenario_id: template for template in ALL_TEMPLATES}
 
 
@@ -845,6 +1391,7 @@ class ScenarioFactory:
 
         refund_amount = t.refund_amount if variant_key is None else self._variant_refund_amount(t, rng)
         age_hours = t.age_hours if variant_key is None else self._variant_age_hours(t, rng)
+        policy_version = self._resolved_policy_version(t, rng)
         subject = t.subject if variant_key is None else self._paraphrase_text(t.subject, rng)
         thread_bodies = (
             list(t.thread_bodies)
@@ -876,6 +1423,7 @@ class ScenarioFactory:
         account_flags = list(t.account_flags)
         if t.suspended_account and "suspended" not in account_flags:
             account_flags.append("suspended")
+        hidden_account_flags = self._hidden_account_flags(t, account_flags, rng)
 
         initial_refund_amount = None if t.requires_request_info else refund_amount
         scenario_token = t.scenario_id if variant_key is None else f"{t.scenario_id}:{variant_key}"
@@ -949,9 +1497,12 @@ class ScenarioFactory:
             objective=t.objective or default_objective,
             max_steps=t.max_steps,
             now=self._base_now,
-            policy_version=t.policy_version,
+            policy_version=policy_version,
+            policy_transition_step=t.policy_transition_step,
+            policy_transition_to=t.policy_transition_to,
             initial_snapshot=initial_snapshot,
             clarification_snapshot=clarification_snapshot,
+            hidden_account_flags=hidden_account_flags,
             ground_truth=GroundTruth(
                 expected_category=t.expected_category,
                 expected_priority=t.expected_priority,
@@ -970,7 +1521,8 @@ class ScenarioFactory:
         )
 
     def _stable_seed(self, key: str) -> int:
-        return sum((index + 1) * ord(char) for index, char in enumerate(f"{self._seed}:{key}"))
+        digest = hashlib.sha256(f"{self._seed}:{key}".encode()).digest()
+        return int.from_bytes(digest[:8], "big") % (2**31)
 
     def _rng_for_key(self, key: str) -> random.Random:
         return random.Random(self._stable_seed(key))
@@ -978,6 +1530,9 @@ class ScenarioFactory:
     def _variant_refund_amount(self, template: ScenarioTemplate, rng: random.Random) -> float | None:
         if template.refund_amount is None:
             return None
+        if template.refund_range is not None:
+            low, high = template.refund_range
+            return round(rng.uniform(low, high), 2)
         amount = float(template.refund_amount)
         if amount > 500:
             varied = amount * rng.uniform(0.9, 1.12)
@@ -989,12 +1544,40 @@ class ScenarioFactory:
         return round(min(495.0, max(15.0, varied)), 2)
 
     def _variant_age_hours(self, template: ScenarioTemplate, rng: random.Random) -> float:
+        if template.age_range is not None:
+            low, high = template.age_range
+            return round(rng.uniform(low, high), 2)
         age = float(template.age_hours)
         if age < 24:
             return round(min(23.5, max(1.0, age + rng.uniform(-4.0, 4.0))), 2)
         if age < 72:
             return round(min(71.5, max(24.5, age + rng.uniform(-6.0, 6.0))), 2)
         return round(max(72.5, age + rng.uniform(-12.0, 12.0)), 2)
+
+    def _resolved_policy_version(
+        self,
+        template: ScenarioTemplate,
+        rng: random.Random,
+    ) -> PolicyVersion:
+        if template.policy_version == "random":
+            return rng.choice(["v1", "v2"])
+        return template.policy_version
+
+    def _hidden_account_flags(
+        self,
+        template: ScenarioTemplate,
+        account_flags: list[str],
+        rng: random.Random,
+    ) -> list[str]:
+        if not template.partial_observability or not account_flags:
+            return []
+        hide_count = template.hidden_account_flag_count or 1
+        hide_count = min(hide_count, len(account_flags))
+        if hide_count == len(account_flags):
+            hide_count = max(0, len(account_flags) - 1)
+        if hide_count <= 0:
+            return []
+        return sorted(rng.sample(account_flags, hide_count))
 
     def _variant_thread_bodies(
         self,

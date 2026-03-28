@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import sqlite3
@@ -10,7 +11,16 @@ from typing import Any
 from pydantic import ValidationError
 
 from .data_generation import ScenarioFactory, scenario_ids_for_task
-from .models import Action, ActionRecord, Difficulty, EpisodePhase, Observation, TaskScenario, TicketSnapshot
+from .models import (
+    Action,
+    ActionRecord,
+    Difficulty,
+    EpisodePhase,
+    Observation,
+    PolicyVersion,
+    TaskScenario,
+    TicketSnapshot,
+)
 from .policies import check_policy_violations, policy_rules_for
 from .rewards import current_progress, invalid_action_breakdown, shaped_reward
 from .tasks import (
@@ -39,10 +49,13 @@ class BusinessPolicyComplianceEnv:
         self.episode_phase = EpisodePhase.initial
         self._simulated_offset_hours = 0.0
         self._snooze_crossed_sla = False
+        self._active_policy_version: PolicyVersion = "v1"
+        self._last_final_score: float | None = None
         self.done = False
 
     def _stable_seed(self, key: str) -> int:
-        return sum((index + 1) * ord(char) for index, char in enumerate(f"{self._seed}:{key}"))
+        digest = hashlib.sha256(f"{self._seed}:{key}".encode()).digest()
+        return int.from_bytes(digest[:8], "big") % (2**31)
 
     def _create_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(":memory:", check_same_thread=False)
@@ -120,6 +133,21 @@ class BusinessPolicyComplianceEnv:
             return 0
         return max(0, len(scenario.clarification_snapshot.thread) - len(scenario.initial_snapshot.thread))
 
+    def _policy_version(self) -> PolicyVersion:
+        return self._active_policy_version
+
+    def _visible_account_flags(self, snapshot: TicketSnapshot) -> list[str]:
+        scenario = self._active_snapshot()
+        hidden = set(scenario.hidden_account_flags)
+        return [flag for flag in snapshot.account_flags if flag not in hidden]
+
+    def _maybe_transition_policy_version(self) -> None:
+        scenario = self._active_snapshot()
+        if scenario.policy_transition_step is None or scenario.policy_transition_to is None:
+            return
+        if len(self.action_history) >= scenario.policy_transition_step:
+            self._active_policy_version = scenario.policy_transition_to
+
     def _step_timestamp(self, step_index: int) -> datetime:
         scenario = self._active_snapshot()
         return scenario.now + timedelta(seconds=step_index)
@@ -146,21 +174,23 @@ class BusinessPolicyComplianceEnv:
     def _observation(self) -> Observation:
         scenario = self._active_snapshot()
         snapshot = self._current_snapshot()
+        visible_flags = self._visible_account_flags(snapshot)
         return Observation(
             scenario_id=scenario.scenario_id,
             difficulty=scenario.difficulty,
             current_email=snapshot.thread[-1],
             thread=snapshot.thread,
             sender_tier=snapshot.sender_tier,
-            account_flags=snapshot.account_flags,
+            account_flags=visible_flags,
+            hidden_flags=len(scenario.hidden_account_flags),
             refund_amount=snapshot.refund_amount,
             issue_age_hours=self._issue_age_hours(),
             emails_remaining=self._emails_remaining(),
             steps_taken=len(self.action_history),
             max_steps=scenario.max_steps,
             action_history=self.action_history,
-            policy_rules=policy_rules_for(scenario.policy_version),
-            policy_version=scenario.policy_version,
+            policy_rules=policy_rules_for(self._policy_version()),
+            policy_version=self._policy_version(),
             task_objective=scenario.objective,
             clarification_received=self.clarification_received,
             episode_phase=self.episode_phase,
@@ -204,7 +234,11 @@ class BusinessPolicyComplianceEnv:
             return False
         if not is_substantive_question(action.clarifying_question):
             return False
-        ground_truth = build_ground_truth_payload(scenario, scenario.clarification_snapshot)
+        ground_truth = build_ground_truth_payload(
+            scenario,
+            scenario.clarification_snapshot,
+            policy_version=self._policy_version(),
+        )
         return request_info_quality(action, ground_truth) >= 0.5
 
     def reset(self, task_name: Difficulty | None = None, scenario_id: str | None = None) -> Observation:
@@ -214,6 +248,8 @@ class BusinessPolicyComplianceEnv:
         self.episode_phase = EpisodePhase.initial
         self._simulated_offset_hours = 0.0
         self._snooze_crossed_sla = False
+        self._active_policy_version = self.current_scenario.policy_version
+        self._last_final_score = None
         self.done = False
         self._reset_connection()
         return self._observation()
@@ -223,15 +259,25 @@ class BusinessPolicyComplianceEnv:
             self.reset()
 
         if self.done:
+            schema_valid = True
+            explanation = "Episode is already complete. Call reset() to start a new ticket."
+            if not isinstance(action_input, Action):
+                try:
+                    Action.model_validate(action_input)
+                except ValidationError as exc:
+                    schema_valid = False
+                    explanation = str(exc)
             observation = self._observation()
             info_done: dict[str, Any] = {
-                "valid_action": False,
-                "final_score": None,
+                "valid_action": schema_valid,
+                "action_accepted": False,
+                "episode_complete": True,
+                "final_score": self._last_final_score,
                 "partial_score": None,
                 "policy_violations": [],
                 "reward_breakdown": {"already_done": 0.0},
                 "component_scores": {},
-                "explanation": "Episode is already complete. Call reset() to start a new ticket.",
+                "explanation": explanation,
             }
             return observation, 0.0, True, info_done
 
@@ -242,6 +288,8 @@ class BusinessPolicyComplianceEnv:
             breakdown = invalid_action_breakdown(str(exc))
             info_invalid: dict[str, Any] = {
                 "valid_action": False,
+                "action_accepted": False,
+                "episode_complete": False,
                 "final_score": None,
                 "partial_score": None,
                 "policy_violations": [],
@@ -255,11 +303,12 @@ class BusinessPolicyComplianceEnv:
         snapshot_before = self._current_snapshot()
         previous_age = self._issue_age_hours()
         prior_actions = [item.action for item in self.action_history]
+        active_policy_version = self._policy_version()
         policy_violations = check_policy_violations(
             action,
             snapshot_before,
             previous_age,
-            scenario.policy_version,
+            active_policy_version,
             prior_actions=prior_actions,
         )
 
@@ -286,7 +335,11 @@ class BusinessPolicyComplianceEnv:
 
         self._advance_phase(action)
 
-        grading_payload = build_ground_truth_payload(scenario, self._grade_snapshot())
+        grading_payload = build_ground_truth_payload(
+            scenario,
+            self._grade_snapshot(),
+            policy_version=active_policy_version,
+        )
         actions = [item.action for item in self.action_history]
         reward_breakdown = shaped_reward(
             actions,
@@ -298,9 +351,15 @@ class BusinessPolicyComplianceEnv:
             fraud_expected=scenario.ground_truth.expected_flag_fraud,
         )
         progress_score, components = current_progress(actions, grading_payload)
+        if self.done:
+            self._last_final_score = progress_score
+        else:
+            self._maybe_transition_policy_version()
         observation = self._observation()
         info_step: dict[str, Any] = {
             "valid_action": True,
+            "action_accepted": True,
+            "episode_complete": self.done,
             "final_score": progress_score if self.done else None,
             "partial_score": None if self.done else progress_score,
             "policy_violations": policy_violations,
@@ -326,9 +385,11 @@ class BusinessPolicyComplianceEnv:
                 "max_steps": scenario.max_steps,
                 "objective": scenario.objective,
                 "title": scenario.title,
-                "policy_version": scenario.policy_version,
+                "policy_version": self._policy_version(),
+                "policy_transition_step": scenario.policy_transition_step,
+                "policy_transition_to": scenario.policy_transition_to,
             },
-            "policy_rules": policy_rules_for(scenario.policy_version),
+            "policy_rules": policy_rules_for(self._policy_version()),
             "internal_variables": {
                 "clarification_received": self.clarification_received,
                 "episode_phase": self.episode_phase,
@@ -336,6 +397,7 @@ class BusinessPolicyComplianceEnv:
                 "snooze_crossed_sla": self._snooze_crossed_sla,
                 "done": self.done,
                 "steps_taken": len(self.action_history),
+                "active_policy_version": self._policy_version(),
             },
         }
 
@@ -354,6 +416,23 @@ class BusinessPolicyComplianceEnv:
         scenario = self._active_snapshot()
         active_snapshot = self._grade_snapshot()
         state = self.state()
-        state["ground_truth"] = build_ground_truth_payload(scenario, active_snapshot)
+        state["ground_truth"] = build_ground_truth_payload(
+            scenario,
+            active_snapshot,
+            policy_version=self._policy_version(),
+        )
         state["dataset_reference"] = scenario.model_dump(mode="json")
         return state
+
+    def render(self, mode: str = "human") -> str | None:
+        if mode != "human":
+            return None
+        if self.current_scenario is None:
+            return "Environment not reset."
+        observation = self._observation()
+        return (
+            f"Scenario: {observation.scenario_id} ({observation.difficulty}) | "
+            f"Phase: {observation.episode_phase} | Step {observation.steps_taken}/{observation.max_steps}\n"
+            f"Subject: {observation.current_email.subject}\n"
+            f"Policy: {observation.policy_version} | Age: {observation.issue_age_hours}h"
+        )

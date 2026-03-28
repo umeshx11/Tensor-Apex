@@ -5,7 +5,8 @@ from datetime import datetime
 from typing import Any
 
 from .data_generation import build_scenarios
-from .models import Action, TaskScenario, TicketSnapshot
+from .llm_grader import score_response_with_optional_llm
+from .models import Action, PolicyVersion, TaskScenario, TicketSnapshot
 from .policies import policies_satisfied
 
 GroundTruthPayload = dict[str, Any]
@@ -30,10 +31,41 @@ def scenarios_for_task(task_name: str | None = None) -> list[TaskScenario]:
     )
 
 
-def build_ground_truth_payload(scenario: TaskScenario, snapshot: TicketSnapshot) -> GroundTruthPayload:
+FILLER_PATTERNS = re.compile(
+    r"^(can you (share|provide|tell)|please (confirm|clarify)|can you clarify|please share)\b.*$",
+    re.IGNORECASE,
+)
+QUESTION_TOPIC_WORDS = {
+    "invoice",
+    "charge",
+    "refund",
+    "account",
+    "order",
+    "date",
+    "amount",
+    "reason",
+    "issue",
+    "card",
+    "payment",
+    "error",
+    "contract",
+    "migration",
+    "outage",
+    "plan",
+}
+
+
+def build_ground_truth_payload(
+    scenario: TaskScenario,
+    snapshot: TicketSnapshot,
+    *,
+    policy_version: PolicyVersion | None = None,
+) -> GroundTruthPayload:
     return {
         "difficulty": scenario.difficulty,
-        "policy_version": scenario.policy_version,
+        "policy_version": policy_version or scenario.policy_version,
+        "policy_transition_step": scenario.policy_transition_step,
+        "policy_transition_to": scenario.policy_transition_to,
         "expected_category": scenario.ground_truth.expected_category,
         "expected_priority": scenario.ground_truth.expected_priority,
         "expected_escalation": scenario.ground_truth.expected_escalation,
@@ -80,9 +112,12 @@ def _request_info_keyword_score(action: Action | None, keywords: list[str]) -> f
 def is_substantive_question(text: str | None) -> bool:
     if not text:
         return False
+    stripped = text.strip()
+    if FILLER_PATTERNS.match(stripped):
+        return False
     tokens = _tokenize(text)
-    question_starters = {"can", "could", "would", "what", "which", "when", "where", "why", "how", "did", "is"}
-    return len(tokens) >= 5 and ("?" in text or bool(set(tokens) & question_starters))
+    has_topic = bool(set(tokens) & QUESTION_TOPIC_WORDS)
+    return len(tokens) >= 7 and has_topic and "?" in stripped
 
 
 def request_info_quality(action: Action | None, ground_truth: GroundTruthPayload) -> float:
@@ -149,6 +184,7 @@ def _response_rubric(
     response_text: str | None,
     response_keywords: list[str],
     history_keywords: list[str],
+    ground_truth: GroundTruthPayload,
 ) -> dict[str, float]:
     if not response_text:
         return {
@@ -157,6 +193,7 @@ def _response_rubric(
             "next_step_actionability": 0.0,
             "tone_acknowledgment": 0.0,
             "anti_stuffing": 0.0,
+            "llm_judge_used": 0.0,
             "response_quality": 0.0,
         }
 
@@ -171,16 +208,19 @@ def _response_rubric(
         ["sorry", "apolog", "understand", "recogn", "appreciate", "thanks", "noted", "aware"],
     )
     anti_stuffing = _anti_stuffing_factor(response_text, response_keywords, history_keywords)
-    response_quality = round(
-        (0.4 * fact_score + 0.25 * next_step_score + 0.2 * tone_score + 0.15 * history_score) * anti_stuffing,
+    heuristic_quality = round(
+        0.4 * fact_score + 0.25 * next_step_score + 0.2 * tone_score + 0.15 * history_score,
         4,
     )
+    llm_score = score_response_with_optional_llm(response_text, ground_truth)
+    response_quality = round(((llm_score if llm_score is not None else heuristic_quality) * anti_stuffing), 4)
     return {
         "case_specific_facts": round(fact_score, 4),
         "history_acknowledgment": round(history_score, 4),
         "next_step_actionability": round(next_step_score, 4),
         "tone_acknowledgment": round(tone_score, 4),
         "anti_stuffing": anti_stuffing,
+        "llm_judge_used": 1.0 if llm_score is not None else 0.0,
         "response_quality": response_quality,
     }
 
@@ -277,6 +317,7 @@ def medium_components(actions: list[Action], ground_truth: GroundTruthPayload) -
         draft_action.response_text if draft_action else None,
         ground_truth["response_keywords"],
         ground_truth["history_keywords"],
+        ground_truth,
     )
     return {
         "ambiguity_recognition": 1.0 if request_info_action else 0.0,
@@ -315,6 +356,7 @@ def hard_components(actions: list[Action], ground_truth: GroundTruthPayload) -> 
         draft_action.response_text if draft_action else None,
         ground_truth["response_keywords"],
         ground_truth["history_keywords"],
+        ground_truth,
     )
     category_score = _categorize_score(actions, ground_truth["expected_category"])
     policy_score = 1.0 if _policy_score(actions, ground_truth) == 1.0 and category_score == 1.0 else 0.0

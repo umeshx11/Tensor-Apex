@@ -9,11 +9,12 @@ description = "Business Policy Compliance and Customer Resolution environment"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi==0.115.12",
-  "uvicorn==0.34.0",
-  "pydantic==2.10.6",
+  "uvicorn>=0.34.0,<1.0.0",
+  "pydantic>=2.10.6,<3.0.0",
   "Faker==37.1.0",
   "httpx==0.28.1",
   "gradio>=4.0.0",
+  "openenv-core>=0.2.0",
 ]
 
 [project.optional-dependencies]
@@ -23,11 +24,17 @@ dev = [
   "mypy>=1.11.0",
 ]
 openai = [
-  "openai==1.68.2",
+  "openai>=2.7.2",
 ]
 
+[project.scripts]
+server = "business_policy_env.server_main:main"
+
 [tool.setuptools.packages.find]
-include = ["business_policy_env*"]
+include = ["business_policy_env*", "server*"]
+
+[tool.setuptools.package-data]
+"business_policy_env" = ["py.typed"]
 
 [tool.ruff]
 line-length = 120

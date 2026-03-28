@@ -84,8 +84,11 @@ class TaskScenario(BaseModel):
     max_steps: int
     now: datetime
     policy_version: PolicyVersion = "v1"
+    policy_transition_step: int | None = None
+    policy_transition_to: PolicyVersion | None = None
     initial_snapshot: TicketSnapshot
     clarification_snapshot: TicketSnapshot | None = None
+    hidden_account_flags: list[str] = Field(default_factory=list)
     ground_truth: GroundTruth
 
 
@@ -150,6 +153,7 @@ class Observation(BaseModel):
     thread: list[EmailMessage]
     sender_tier: SenderTier
     account_flags: list[str]
+    hidden_flags: int = 0
     refund_amount: float | None = None
     issue_age_hours: float
     emails_remaining: int
@@ -167,6 +171,8 @@ class StepInfo(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     valid_action: bool
+    action_accepted: bool = True
+    episode_complete: bool = False
     final_score: float | None = None
     partial_score: float | None = None
     policy_violations: list[str] = Field(default_factory=list)

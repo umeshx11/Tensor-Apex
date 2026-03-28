@@ -34,6 +34,7 @@ def format_observation(obs: Observation) -> str:
         f"**Sender tier:** {obs.sender_tier}",
         f"**Refund amount:** {'$' + str(obs.refund_amount) if obs.refund_amount is not None else 'N/A'}",
         f"**Account flags:** {', '.join(obs.account_flags) if obs.account_flags else 'none'}",
+        f"**Hidden account flags:** {obs.hidden_flags}",
         "",
         "**Latest email:**",
         f"> Subject: {obs.current_email.subject}",

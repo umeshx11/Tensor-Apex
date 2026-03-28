@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -39,7 +40,8 @@ class SessionManager:
         self._rate_windows: dict[str, deque[float]] = defaultdict(deque)
 
     def _stable_seed(self, key: str) -> int:
-        return self._base_seed + sum((index + 1) * ord(char) for index, char in enumerate(key))
+        digest = hashlib.sha256(f"{self._base_seed}:{key}".encode()).digest()
+        return int.from_bytes(digest[:8], "big") % (2**31)
 
     def _now(self) -> float:
         return time.time()

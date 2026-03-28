@@ -14,7 +14,13 @@ from business_policy_env.session_manager import (
     SessionManager,
     get_session_manager,
 )
-from business_policy_env.tasks import build_ground_truth_payload, component_scores, grade_actions, scenario_registry
+from business_policy_env.tasks import (
+    build_ground_truth_payload,
+    component_scores,
+    grade_actions,
+    is_substantive_question,
+    scenario_registry,
+)
 from gradio_app import reset_episode, take_action
 
 
@@ -91,6 +97,15 @@ class EnvironmentTests(unittest.TestCase):
             second = grade_actions(actions, ground_truth)
             self.assertEqual(first, second)
 
+    def test_scenario_bank_expanded_beyond_original_catalog(self) -> None:
+        self.assertGreaterEqual(len(scenario_ids_for_task()), 52)
+
+    def test_substantive_question_rejects_generic_filler(self) -> None:
+        self.assertFalse(is_substantive_question("Can you provide more?"))
+        self.assertTrue(
+            is_substantive_question("Can you confirm the invoice amount and the card used for this charge?")
+        )
+
     def test_invalid_action_penalty_is_negative_and_state_is_stable(self) -> None:
         self.env.reset(scenario_id="easy_vip_refund")
         observation, reward, done, info = self.env.step({"action_type": "categorize", "reasoning": "Missing field"})
@@ -151,6 +166,13 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(clarified_obs.emails_remaining, 0)
         self.assertIn("duplicate renewal charge", clarified_obs.current_email.body.lower())
 
+    def test_partial_observability_hides_some_account_flags(self) -> None:
+        scenario = scenario_registry()["hard_hidden_flag_dispute"]
+        observation = self.env.reset(scenario_id="hard_hidden_flag_dispute")
+        self.assertEqual(observation.hidden_flags, 1)
+        self.assertLess(len(observation.account_flags), len(scenario.initial_snapshot.account_flags))
+        self.assertNotEqual(sorted(observation.account_flags), sorted(scenario.initial_snapshot.account_flags))
+
     def test_ambiguous_ticket_retains_partial_credit_when_request_info_is_skipped(self) -> None:
         self.env.reset(scenario_id="medium_charge_or_bug")
         final_info = None
@@ -208,6 +230,29 @@ class EnvironmentTests(unittest.TestCase):
         coherent_components = component_scores(coherent_actions, ground_truth)
         keyword_components = component_scores(keyword_dump_actions, ground_truth)
         self.assertGreater(coherent_components["response_completeness"], keyword_components["response_completeness"])
+
+    def test_policy_version_can_transition_mid_episode(self) -> None:
+        observation = self.env.reset(scenario_id="hard_policy_shift_fraud_upgrade")
+        self.assertEqual(observation.policy_version, "v1")
+        for action in [
+            Action(action_type="categorize", reasoning="Billing issue.", category="billing"),
+            Action(action_type="set_priority", reasoning="Premier issue.", priority="high"),
+            Action(
+                action_type="draft_response",
+                reasoning="Send an update before the new policy applies.",
+                response_text="We are reviewing the account and will send an update today.",
+            ),
+        ]:
+            observation, _, _, _ = self.env.step(action)
+        self.assertEqual(observation.policy_version, "v2")
+        _, _, _, info = self.env.step(
+            Action(
+                action_type="draft_response",
+                reasoning="Still responding without a fraud flag.",
+                response_text="We are still reviewing the account and will update you again.",
+            )
+        )
+        self.assertIn("Fraud indicators require flag_fraud before resolution actions.", info["policy_violations"])
 
     def test_task_resets_build_variants_from_shuffled_families(self) -> None:
         env = BusinessPolicyComplianceEnv(seed=11)
@@ -290,6 +335,38 @@ class EnvironmentTests(unittest.TestCase):
 
     def test_root_baseline_entrypoint_exports_main(self) -> None:
         self.assertTrue(callable(root_baseline.main))
+
+    def test_done_branch_reports_episode_complete_for_valid_follow_on_actions(self) -> None:
+        self.env.reset(scenario_id="easy_vip_refund")
+        for action in [
+            Action(action_type="categorize", reasoning="Billing ticket.", category="billing"),
+            Action(action_type="set_priority", reasoning="VIP refund.", priority="high"),
+            Action(
+                action_type="escalate",
+                reasoning="Refund threshold.",
+                escalation_reason="Refund exceeds threshold.",
+            ),
+        ]:
+            _, _, done, _ = self.env.step(action)
+        self.assertTrue(done)
+        _, _, done_again, info = self.env.step(
+            Action(
+                action_type="draft_response",
+                reasoning="Episode already ended.",
+                response_text="Following up with an additional note.",
+            )
+        )
+        self.assertTrue(done_again)
+        self.assertTrue(info["valid_action"])
+        self.assertTrue(info["episode_complete"])
+        self.assertFalse(info["action_accepted"])
+
+    def test_render_returns_human_summary(self) -> None:
+        self.env.reset(scenario_id="easy_sla_breach")
+        rendered = self.env.render()
+        self.assertIsInstance(rendered, str)
+        self.assertIn("Scenario:", rendered)
+        self.assertIn("Policy:", rendered)
 
 
 class SessionManagerTests(unittest.TestCase):

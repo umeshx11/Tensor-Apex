@@ -30,8 +30,5 @@ jobs:
           trap 'docker rm -f business-policy-env-smoke' EXIT
           timeout 60 bash -c 'until curl -fsS http://127.0.0.1:7860/health; do sleep 1; done'
       - run: |
-          if command -v openenv >/dev/null 2>&1; then
-            openenv validate
-          else
-            echo "openenv not installed; skipping validation"
-          fi
+          pip install openenv-core
+          openenv validate
