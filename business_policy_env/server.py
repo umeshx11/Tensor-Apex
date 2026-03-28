@@ -1,17 +1,28 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request
 
 from .data_generation import scenario_ids_for_task
+from .environment import BusinessPolicyComplianceEnv
 from .models import Observation, ResetRequest, StepRequest, StepResult
 from .session_manager import RateLimitError, SessionCapacityError, get_session_manager
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    yield
+    get_session_manager().close_all()
+
 
 app = FastAPI(
     title="Business Policy Compliance and Customer Resolution Environment",
     description="An OpenEnv-style environment for policy-aware customer support reasoning under uncertainty.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 
@@ -30,16 +41,11 @@ def _enforce_rate_limit(request: Request, session_id: str) -> None:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
 
 
-def _get_or_create_env(session_id: str):
+def _get_or_create_env(session_id: str) -> BusinessPolicyComplianceEnv:
     try:
         return get_session_manager().get_or_create(session_id)
     except SessionCapacityError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-
-@app.on_event("shutdown")
-def shutdown() -> None:
-    get_session_manager().close_all()
 
 
 @app.get("/health")

@@ -10,7 +10,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from .data_generation import ScenarioFactory, scenario_ids_for_task
-from .models import Action, ActionRecord, EpisodePhase, Observation, TaskScenario, TicketSnapshot
+from .models import Action, ActionRecord, Difficulty, EpisodePhase, Observation, TaskScenario, TicketSnapshot
 from .policies import check_policy_violations, policy_rules_for
 from .rewards import current_progress, invalid_action_breakdown, shaped_reward
 from .tasks import (
@@ -25,7 +25,8 @@ class BusinessPolicyComplianceEnv:
     def __init__(self, seed: int = 20260328) -> None:
         self._seed = seed
         self._scenario_factory = ScenarioFactory(seed=seed)
-        self._task_family_ids = {task: scenario_ids_for_task(task) for task in ("easy", "medium", "hard")}
+        task_names: tuple[Difficulty, ...] = ("easy", "medium", "hard")
+        self._task_family_ids = {task: scenario_ids_for_task(task) for task in task_names}
         self._shuffle_bags: dict[str, list[str]] = defaultdict(list)
         self._selection_rngs = {
             task: random.Random(self._stable_seed(f"shuffle:{task}")) for task in self._task_family_ids
@@ -73,7 +74,7 @@ class BusinessPolicyComplianceEnv:
     def available_tasks(self) -> dict[str, list[str]]:
         return {task: list(ids) for task, ids in self._task_family_ids.items()}
 
-    def _next_family_id(self, task_name: str) -> str:
+    def _next_family_id(self, task_name: Difficulty) -> str:
         bag = self._shuffle_bags[task_name]
         if not bag:
             bag = list(self._task_family_ids[task_name])
@@ -81,11 +82,11 @@ class BusinessPolicyComplianceEnv:
             self._shuffle_bags[task_name] = bag
         return self._shuffle_bags[task_name].pop()
 
-    def _select_scenario(self, task_name: str | None, scenario_id: str | None) -> TaskScenario:
+    def _select_scenario(self, task_name: Difficulty | None, scenario_id: str | None) -> TaskScenario:
         if scenario_id:
             return self._scenario_factory.build_canonical_scenario(scenario_id)
 
-        selected_task = task_name or "easy"
+        selected_task: Difficulty = "easy" if task_name is None else task_name
         family_id = self._next_family_id(selected_task)
         variant_index = self._variant_counters[selected_task]
         self._variant_counters[selected_task] += 1
@@ -178,7 +179,9 @@ class BusinessPolicyComplianceEnv:
         if phase == EpisodePhase.initial:
             if action.action_type == "request_info":
                 self.episode_phase = (
-                    EpisodePhase.post_clarification if self.clarification_received else EpisodePhase.awaiting_clarification
+                    EpisodePhase.post_clarification
+                    if self.clarification_received
+                    else EpisodePhase.awaiting_clarification
                 )
             elif action.action_type in resolving_actions:
                 self.episode_phase = EpisodePhase.resolving
@@ -193,14 +196,18 @@ class BusinessPolicyComplianceEnv:
             self.episode_phase = EpisodePhase.complete
 
     def _should_unlock_clarification(self, action: Action, scenario: TaskScenario) -> bool:
-        if action.action_type != "request_info" or scenario.clarification_snapshot is None or self.clarification_received:
+        if (
+            action.action_type != "request_info"
+            or scenario.clarification_snapshot is None
+            or self.clarification_received
+        ):
             return False
         if not is_substantive_question(action.clarifying_question):
             return False
         ground_truth = build_ground_truth_payload(scenario, scenario.clarification_snapshot)
         return request_info_quality(action, ground_truth) >= 0.5
 
-    def reset(self, task_name: str | None = None, scenario_id: str | None = None) -> Observation:
+    def reset(self, task_name: Difficulty | None = None, scenario_id: str | None = None) -> Observation:
         self.current_scenario = self._select_scenario(task_name, scenario_id)
         self.action_history = []
         self.clarification_received = False

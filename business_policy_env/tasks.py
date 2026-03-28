@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
 import re
+from datetime import datetime
 from typing import Any
 
 from .data_generation import build_scenarios
@@ -145,7 +145,11 @@ def _anti_stuffing_factor(
     return round(factor, 4)
 
 
-def _response_rubric(response_text: str | None, response_keywords: list[str], history_keywords: list[str]) -> dict[str, float]:
+def _response_rubric(
+    response_text: str | None,
+    response_keywords: list[str],
+    history_keywords: list[str],
+) -> dict[str, float]:
     if not response_text:
         return {
             "case_specific_facts": 0.0,

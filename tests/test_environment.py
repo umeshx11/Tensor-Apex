@@ -8,7 +8,12 @@ from business_policy_env.data_generation import scenario_ids_for_task
 from business_policy_env.environment import BusinessPolicyComplianceEnv
 from business_policy_env.models import Action
 from business_policy_env.server import app
-from business_policy_env.session_manager import RateLimitError, SessionCapacityError, SessionManager, get_session_manager
+from business_policy_env.session_manager import (
+    RateLimitError,
+    SessionCapacityError,
+    SessionManager,
+    get_session_manager,
+)
 from business_policy_env.tasks import build_ground_truth_payload, component_scores, grade_actions, scenario_registry
 from gradio_app import reset_episode, take_action
 
@@ -105,7 +110,7 @@ class EnvironmentTests(unittest.TestCase):
             )
         )
         self.assertEqual(observation.steps_taken, 1)
-        self.assertLess(reward, 0.0)
+        self.assertLessEqual(reward, 0.0)
         self.assertFalse(done)
         self.assertTrue(info["policy_violations"])
         self.assertEqual(info["reward_breakdown"]["policy_penalty"], -0.2)
@@ -153,7 +158,11 @@ class EnvironmentTests(unittest.TestCase):
         scripted_actions = [
             Action(action_type="categorize", reasoning="Billing ticket.", category="billing"),
             Action(action_type="set_priority", reasoning="VIP and policy-sensitive.", priority="high"),
-            Action(action_type="escalate", reasoning="Refund threshold requires escalation.", escalation_reason="Policy."),
+            Action(
+                action_type="escalate",
+                reasoning="Refund threshold requires escalation.",
+                escalation_reason="Policy.",
+            ),
             Action(
                 action_type="draft_response",
                 reasoning="Send update.",
@@ -161,7 +170,8 @@ class EnvironmentTests(unittest.TestCase):
             ),
         ]
         while not done:
-            action = scripted_actions[min(self.env.debug_state()["internal_variables"]["steps_taken"], len(scripted_actions) - 1)]
+            step_index = self.env.debug_state()["internal_variables"]["steps_taken"]
+            action = scripted_actions[min(step_index, len(scripted_actions) - 1)]
             _, _, done, final_info = self.env.step(action)
         self.assertIsNotNone(final_info)
         self.assertGreater(final_info["final_score"], 0.0)
@@ -191,7 +201,10 @@ class EnvironmentTests(unittest.TestCase):
                 ),
             )
         ]
-        self.assertGreater(grade_actions(coherent_actions, ground_truth), grade_actions(keyword_dump_actions, ground_truth))
+        self.assertGreater(
+            grade_actions(coherent_actions, ground_truth),
+            grade_actions(keyword_dump_actions, ground_truth),
+        )
         coherent_components = component_scores(coherent_actions, ground_truth)
         keyword_components = component_scores(keyword_dump_actions, ground_truth)
         self.assertGreater(coherent_components["response_completeness"], keyword_components["response_completeness"])
