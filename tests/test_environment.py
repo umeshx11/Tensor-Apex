@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 
 import baseline as root_baseline
 from business_policy_env.baseline import RuleBasedAgent, run_baseline
-from business_policy_env.data_generation import scenario_ids_for_task
+from business_policy_env.data_generation import ScenarioFactory, scenario_ids_for_task
 from business_policy_env.environment import BusinessPolicyComplianceEnv
 from business_policy_env.models import Action
 from business_policy_env.server import app
@@ -244,6 +244,21 @@ class EnvironmentTests(unittest.TestCase):
         self.assertGreater(_coherence_gate(hard_structured, "hard"), _coherence_gate(keyword_dump, "hard"))
         self.assertGreater(_coherence_gate(medium_structured, "medium"), 0.5)
 
+    def test_coherence_gate_preserves_hard_floor_for_degenerate_responses(self) -> None:
+        self.assertEqual(_coherence_gate("ok ok ok", "hard"), 0.15)
+
+    def test_coherence_gate_rewards_connector_density(self) -> None:
+        plain_response = (
+            "We reviewed the invoice issue. "
+            "We will send an update today. "
+            "The team is checking the account."
+        )
+        connected_response = (
+            "We reviewed the invoice issue because the charge is still open. "
+            "We will send an update today after the team checks the account."
+        )
+        self.assertGreater(_coherence_gate(connected_response, "hard"), _coherence_gate(plain_response, "hard"))
+
     def test_policy_version_can_transition_mid_episode(self) -> None:
         observation = self.env.reset(scenario_id="hard_policy_shift_fraud_upgrade")
         self.assertEqual(observation.policy_version, "v1")
@@ -280,6 +295,21 @@ class EnvironmentTests(unittest.TestCase):
         env.close()
         self.assertCountEqual(observed_families, canonical_order)
         self.assertNotEqual(observed_families, canonical_order)
+
+    def test_variant_email_bodies_are_deterministic_and_more_email_like(self) -> None:
+        factory = ScenarioFactory(seed=20260328)
+        canonical = factory.build_canonical_scenario("easy_standard_small_refund")
+        variant = factory.build_variant_scenario("easy_standard_small_refund", "realism-check")
+        repeated_variant = factory.build_variant_scenario("easy_standard_small_refund", "realism-check")
+
+        canonical_body = canonical.initial_snapshot.thread[0].body
+        variant_body = variant.initial_snapshot.thread[0].body
+
+        self.assertEqual(variant_body, repeated_variant.initial_snapshot.thread[0].body)
+        self.assertNotEqual(canonical_body, variant_body)
+        self.assertIn("\n\n", variant_body)
+        self.assertRegex(variant_body, r"^(Hi|Hello|Good)")
+        self.assertRegex(variant_body, r"INV-\d{4}")
 
     def test_fastapi_endpoints_return_sanitized_state(self) -> None:
         client = TestClient(app)

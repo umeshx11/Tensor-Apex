@@ -1404,26 +1404,56 @@ class ScenarioFactory:
                 t.scenario_id if variant_key is None else f"{t.scenario_id}:{variant_key}:faker"
             )
         )
+        sender_name = fake.name()
+        sender_email = fake.email()
 
+        scenario_token = t.scenario_id if variant_key is None else f"{t.scenario_id}:{variant_key}"
+        deterministic_id = self._stable_seed(scenario_token) % 1000
+        order_seed = self._stable_seed(f"{scenario_token}:order") % 10000
+        invoice_seed = self._stable_seed(f"{scenario_token}:invoice") % 10000
+        workspace_seed = self._stable_seed(f"{scenario_token}:workspace") % 1000
+        ticket_id = f"T-{t.difficulty.upper()}-{deterministic_id:03d}"
+        order_id = f"ORD-{order_seed:04d}"
+        invoice_id = f"INV-{invoice_seed:04d}"
+        workspace_name = f"Workspace {workspace_seed:03d}"
         refund_amount = t.refund_amount if variant_key is None else self._variant_refund_amount(t, rng)
         age_hours = t.age_hours if variant_key is None else self._variant_age_hours(t, rng)
         policy_version = self._resolved_policy_version(t, rng)
         subject = t.subject if variant_key is None else self._paraphrase_text(t.subject, rng)
+        directions = self._message_directions(t)
         thread_bodies = (
             list(t.thread_bodies)
             if variant_key is None
-            else self._variant_thread_bodies(t, rng, refund_amount)
+            else self._variant_thread_bodies(
+                t,
+                rng,
+                refund_amount,
+                directions=directions,
+                sender_name=sender_name,
+                order_id=order_id,
+                invoice_id=invoice_id,
+                workspace_name=workspace_name,
+            )
         )
         clarification_body = (
             t.clarification_body
             if variant_key is None or t.clarification_body is None
-            else self._variant_text(t.clarification_body, t, rng, refund_amount)
+            else self._variant_text(
+                t.clarification_body,
+                t,
+                rng,
+                refund_amount,
+                direction="customer",
+                sender_name=sender_name,
+                order_id=order_id,
+                invoice_id=invoice_id,
+                workspace_name=workspace_name,
+                message_index=max(0, len(t.thread_bodies) - 1),
+                total_messages=max(1, len(t.thread_bodies)),
+            )
         )
 
-        sender_name = fake.name()
-        sender_email = fake.email()
         first_message_time = self._base_now - timedelta(hours=age_hours)
-        directions = self._message_directions(t)
         thread = self._build_thread(
             t,
             subject,
@@ -1442,10 +1472,6 @@ class ScenarioFactory:
         hidden_account_flags = self._hidden_account_flags(t, account_flags, rng)
 
         initial_refund_amount = None if t.requires_request_info else refund_amount
-        scenario_token = t.scenario_id if variant_key is None else f"{t.scenario_id}:{variant_key}"
-        deterministic_id = self._stable_seed(scenario_token) % 1000
-        order_seed = self._stable_seed(f"{scenario_token}:order") % 10000
-        ticket_id = f"T-{t.difficulty.upper()}-{deterministic_id:03d}"
         scenario_id = (
             t.scenario_id
             if variant_key is None
@@ -1458,7 +1484,7 @@ class ScenarioFactory:
             sender_tier=t.sender_tier,
             account_flags=account_flags,
             refund_amount=initial_refund_amount,
-            order_id=f"ORD-{order_seed:04d}",
+            order_id=order_id,
             visible_problem_type=t.visible_problem_type,
         )
 
@@ -1482,7 +1508,7 @@ class ScenarioFactory:
                 sender_tier=t.sender_tier,
                 account_flags=account_flags,
                 refund_amount=refund_amount,
-                order_id=f"ORD-{order_seed:04d}",
+                order_id=order_id,
                 visible_problem_type=t.expected_category,
             )
 
@@ -1602,8 +1628,30 @@ class ScenarioFactory:
         template: ScenarioTemplate,
         rng: random.Random,
         refund_amount: float | None,
+        *,
+        directions: list[Literal["customer", "agent", "system"]],
+        sender_name: str,
+        order_id: str,
+        invoice_id: str,
+        workspace_name: str,
     ) -> list[str]:
-        return [self._variant_text(body, template, rng, refund_amount) for body in template.thread_bodies]
+        total_messages = len(template.thread_bodies)
+        return [
+            self._variant_text(
+                body,
+                template,
+                rng,
+                refund_amount,
+                direction=directions[index],
+                sender_name=sender_name,
+                order_id=order_id,
+                invoice_id=invoice_id,
+                workspace_name=workspace_name,
+                message_index=index,
+                total_messages=total_messages,
+            )
+            for index, body in enumerate(template.thread_bodies)
+        ]
 
     def _variant_text(
         self,
@@ -1611,11 +1659,31 @@ class ScenarioFactory:
         template: ScenarioTemplate,
         rng: random.Random,
         refund_amount: float | None,
+        *,
+        direction: Literal["customer", "agent", "system"],
+        sender_name: str,
+        order_id: str,
+        invoice_id: str,
+        workspace_name: str,
+        message_index: int,
+        total_messages: int,
     ) -> str:
         updated = self._paraphrase_text(text, rng)
         if template.refund_amount is not None and refund_amount is not None:
             updated = self._replace_amount_mentions(updated, template.refund_amount, refund_amount)
-        return updated
+        return self._enrich_email_body(
+            updated,
+            template,
+            rng,
+            direction=direction,
+            sender_name=sender_name,
+            order_id=order_id,
+            invoice_id=invoice_id,
+            workspace_name=workspace_name,
+            refund_amount=refund_amount,
+            message_index=message_index,
+            total_messages=total_messages,
+        )
 
     def _replace_amount_mentions(self, text: str, original_amount: float, new_amount: float) -> str:
         rounded_original = int(round(original_amount))
@@ -1655,6 +1723,175 @@ class ScenarioFactory:
             replacement = rng.choice(options)
             updated = pattern.sub(lambda _: replacement, updated, count=1)
         return updated
+
+    def _enrich_email_body(
+        self,
+        text: str,
+        template: ScenarioTemplate,
+        rng: random.Random,
+        *,
+        direction: Literal["customer", "agent", "system"],
+        sender_name: str,
+        order_id: str,
+        invoice_id: str,
+        workspace_name: str,
+        refund_amount: float | None,
+        message_index: int,
+        total_messages: int,
+    ) -> str:
+        normalized = re.sub(r"\s+", " ", text).strip()
+        if direction == "system":
+            prefix = rng.choice(["System note:", "Workflow update:", "Status update:"])
+            return f"{prefix} {normalized}"
+        if template.visible_problem_type == "spam":
+            hook = rng.choice(["Limited-time growth offer.", "Exclusive promotion.", "Guaranteed results."])
+            return f"{hook}\n\n{normalized}"
+        if direction == "agent":
+            prefix = rng.choice(["Support follow-up:", "Agent note:", "Team response:"])
+            detail = self._contextual_detail(
+                template,
+                refund_amount=refund_amount,
+                order_id=order_id,
+                invoice_id=invoice_id,
+                workspace_name=workspace_name,
+                include_workspace=False,
+                rng=rng,
+            )
+            return self._join_sentences(f"{prefix} {normalized}", detail)
+        return self._customer_email_body(
+            normalized,
+            template,
+            rng,
+            sender_name=sender_name,
+            refund_amount=refund_amount,
+            order_id=order_id,
+            invoice_id=invoice_id,
+            workspace_name=workspace_name,
+            message_index=message_index,
+            total_messages=total_messages,
+        )
+
+    def _customer_email_body(
+        self,
+        text: str,
+        template: ScenarioTemplate,
+        rng: random.Random,
+        *,
+        sender_name: str,
+        refund_amount: float | None,
+        order_id: str,
+        invoice_id: str,
+        workspace_name: str,
+        message_index: int,
+        total_messages: int,
+    ) -> str:
+        greeting = rng.choice(
+            ["Hi support team,", "Hello team,", "Hi there,", "Good morning,", "Hello support,"]
+        )
+        first_name = sender_name.split()[0]
+        detail = self._contextual_detail(
+            template,
+            refund_amount=refund_amount,
+            order_id=order_id,
+            invoice_id=invoice_id,
+            workspace_name=workspace_name,
+            include_workspace=True,
+            rng=rng,
+        )
+        if total_messages > 1 and message_index > 0:
+            lead = rng.choice(
+                [
+                    "Following up because this is still blocking us.",
+                    "Checking back because we still need an answer here.",
+                    "This is still open on our side, so I wanted to follow up.",
+                ]
+            )
+            body_text = self._join_sentences(lead, text)
+        else:
+            body_text = text
+        body_text = self._join_sentences(body_text, detail)
+        closing = rng.choice(
+            [
+                "Thanks,",
+                "Thank you,",
+                "Appreciate the help,",
+                "Please keep me posted,",
+            ]
+        )
+        return "\n\n".join([greeting, body_text, f"{closing}\n{first_name}"])
+
+    def _contextual_detail(
+        self,
+        template: ScenarioTemplate,
+        *,
+        refund_amount: float | None,
+        order_id: str,
+        invoice_id: str,
+        workspace_name: str,
+        include_workspace: bool,
+        rng: random.Random,
+    ) -> str | None:
+        details: list[str] = []
+        if refund_amount is not None:
+            details.extend(
+                [
+                    f"The amount in question on invoice {invoice_id} is ${refund_amount:.2f}.",
+                    f"This appears on invoice {invoice_id} for ${refund_amount:.2f}.",
+                ]
+            )
+        if template.visible_problem_type == "returns":
+            details.extend(
+                [
+                    f"The order reference is {order_id} if that helps locate it quickly.",
+                    f"The item is tied to order {order_id}.",
+                ]
+            )
+        if template.visible_problem_type == "technical_support":
+            details.extend(
+                [
+                    f"This is affecting {workspace_name} right now.",
+                    "The problem started immediately after the latest product change.",
+                ]
+            )
+        if template.visible_problem_type == "customer_success":
+            details.extend(
+                [
+                    f"We are trying to finish setup for {workspace_name} this week.",
+                    f"Our admins are blocked on {workspace_name} until this is resolved.",
+                ]
+            )
+        if "suspended" in template.account_flags or template.suspended_account:
+            details.extend(
+                [
+                    "The billing console is also showing the account as suspended.",
+                    "We are seeing a suspended-account notice in billing.",
+                ]
+            )
+        if include_workspace and template.sender_tier in {"vip", "premier"}:
+            details.extend(
+                [
+                    f"This is affecting our {template.sender_tier} workspace.",
+                    f"This is coming from our {template.sender_tier} account team.",
+                ]
+            )
+        if template.visible_problem_type == "legal":
+            details.extend(
+                [
+                    "I need to understand the next step today because counsel is already asking for an update.",
+                    "Our team needs a concrete next step today because counsel is involved.",
+                ]
+            )
+        if not details:
+            return None
+        return rng.choice(details)
+
+    def _join_sentences(self, first: str, second: str | None) -> str:
+        if not second:
+            return first.strip()
+        trimmed_first = first.strip()
+        if trimmed_first and trimmed_first[-1] not in ".!?":
+            trimmed_first = f"{trimmed_first}."
+        return f"{trimmed_first} {second.strip()}".strip()
 
     def _message_directions(self, t: ScenarioTemplate) -> list[Literal["customer", "agent", "system"]]:
         if not t.thread_directions:
