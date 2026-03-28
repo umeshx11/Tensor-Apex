@@ -15,6 +15,7 @@ from business_policy_env.session_manager import (
     get_session_manager,
 )
 from business_policy_env.tasks import (
+    _coherence_gate,
     build_ground_truth_payload,
     component_scores,
     grade_actions,
@@ -232,6 +233,17 @@ class EnvironmentTests(unittest.TestCase):
         keyword_components = component_scores(keyword_dump_actions, ground_truth)
         self.assertGreater(coherent_components["response_completeness"], keyword_components["response_completeness"])
 
+    def test_coherence_gate_prefers_structured_responses_without_zeroing_medium_replies(self) -> None:
+        keyword_dump = "invoice refund account payment error"
+        medium_structured = "We reviewed the invoice issue and will send an update after checking the account today."
+        hard_structured = (
+            "We reviewed the invoice issue and the account history. "
+            "We will send an update today after the team checks the payment details."
+        )
+        self.assertGreater(_coherence_gate(medium_structured, "medium"), _coherence_gate(keyword_dump, "medium"))
+        self.assertGreater(_coherence_gate(hard_structured, "hard"), _coherence_gate(keyword_dump, "hard"))
+        self.assertGreater(_coherence_gate(medium_structured, "medium"), 0.5)
+
     def test_policy_version_can_transition_mid_episode(self) -> None:
         observation = self.env.reset(scenario_id="hard_policy_shift_fraud_upgrade")
         self.assertEqual(observation.policy_version, "v1")
@@ -420,6 +432,45 @@ class EnvironmentTests(unittest.TestCase):
         strong_components = component_scores(strong_actions, ground_truth)
         self.assertGreater(strong_components["contradiction_detection"], weak_components["contradiction_detection"])
         self.assertGreater(grade_actions(strong_actions, ground_truth), grade_actions(weak_actions, ground_truth))
+
+    def test_hard_conflict_fallback_uses_policy_and_snapshot_signals(self) -> None:
+        scenario = scenario_registry()["hard_vip_refund_lawyer"]
+        self.assertEqual(scenario.ground_truth.conflict_keywords, [])
+        ground_truth = build_ground_truth_payload(scenario, scenario.initial_snapshot)
+        weak_actions = [
+            Action(action_type="categorize", reasoning="Legal issue.", category="legal"),
+            Action(action_type="set_priority", reasoning="Urgent issue.", priority="urgent"),
+            Action(action_type="escalate", reasoning="Escalate.", escalation_reason="Policy."),
+            Action(
+                action_type="draft_response",
+                reasoning="Reply.",
+                response_text="We are reviewing this matter now.",
+            ),
+        ]
+        strong_actions = [
+            Action(action_type="categorize", reasoning="Legal refund issue for a VIP.", category="legal"),
+            Action(
+                action_type="set_priority",
+                reasoning="VIP and legal pressure require urgency.",
+                priority="urgent",
+            ),
+            Action(
+                action_type="escalate",
+                reasoning="Escalate the refund and legal complaint.",
+                escalation_reason="Policy.",
+            ),
+            Action(
+                action_type="draft_response",
+                reasoning="Acknowledge the refund, VIP status, and legal urgency.",
+                response_text=(
+                    "We understand the refund issue and the legal urgency for your VIP account. "
+                    "We have escalated the review and will send an update today."
+                ),
+            ),
+        ]
+        weak_components = component_scores(weak_actions, ground_truth)
+        strong_components = component_scores(strong_actions, ground_truth)
+        self.assertGreater(strong_components["contradiction_detection"], weak_components["contradiction_detection"])
 
     def test_hard_ordering_component_penalizes_wrong_sequence(self) -> None:
         scenario = scenario_registry()["hard_three_signal_precedence"]

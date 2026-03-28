@@ -7,7 +7,7 @@ from typing import Any, cast
 from .data_generation import build_scenarios
 from .llm_grader import score_response_with_optional_llm
 from .models import Action, ActionType, PolicyVersion, TaskScenario, TicketSnapshot
-from .policies import policies_satisfied
+from .policies import compute_policy_expectations, policies_satisfied
 
 GroundTruthPayload = dict[str, Any]
 
@@ -190,24 +190,57 @@ def _anti_stuffing_factor(
     return round(factor, 4)
 
 
+def _bounded_ratio(value: float, target: float) -> float:
+    if target <= 0:
+        return 1.0
+    return max(0.0, min(1.0, round(value / target, 4)))
+
+
 def _coherence_gate(response_text: str, difficulty: str | None = None) -> float:
     sentences = [segment.strip() for segment in re.split(r"[.!?]", response_text) if len(segment.strip()) > 8]
     tokens = _tokenize(response_text)
     if not tokens:
         return 0.0
-    unique_ratio = len(set(tokens)) / len(tokens)
-    if difficulty == "medium":
-        if len(sentences) < 2:
-            return 0.75 if len(tokens) >= 8 else 0.5
-        if unique_ratio < 0.45:
-            return 0.7
-        return 1.0
 
-    if len(sentences) < 2:
-        return 0.2
-    if unique_ratio < 0.45:
-        return 0.5
-    return 1.0
+    lowered = response_text.lower()
+    connector_hits = sum(
+        lowered.count(marker)
+        for marker in [" because ", " and ", " after ", " before ", " while ", " if ", " when ", " but "]
+    )
+    unique_ratio = len(set(tokens)) / len(tokens)
+    profile = {
+        "medium": {
+            "sentence_target": 1.5,
+            "token_target": 12.0,
+            "variety_target": 0.58,
+            "connector_target": 1.0,
+        },
+        "hard": {
+            "sentence_target": 2.2,
+            "token_target": 18.0,
+            "variety_target": 0.62,
+            "connector_target": 2.0,
+        },
+    }.get(difficulty or "hard", {
+        "sentence_target": 2.2,
+        "token_target": 18.0,
+        "variety_target": 0.62,
+        "connector_target": 2.0,
+    })
+
+    sentence_score = _bounded_ratio(float(len(sentences)), profile["sentence_target"])
+    length_score = _bounded_ratio(float(len(tokens)), profile["token_target"])
+    variety_score = _bounded_ratio(unique_ratio, profile["variety_target"])
+    connector_score = _bounded_ratio(float(connector_hits), profile["connector_target"])
+
+    coherence = round(
+        0.4 * sentence_score + 0.25 * length_score + 0.2 * variety_score + 0.15 * connector_score,
+        4,
+    )
+    if difficulty == "hard" and len(sentences) < 2:
+        single_sentence_cap = 0.26 + 0.12 * _bounded_ratio(float(len(tokens)), 20.0)
+        coherence = min(coherence, round(single_sentence_cap, 4))
+    return max(0.15, coherence)
 
 
 def _response_rubric(
@@ -267,16 +300,57 @@ def _response_rubric(
 
 def _contradiction_detection_score(actions: list[Action], ground_truth: GroundTruthPayload) -> float:
     conflict_keywords: list[str] = ground_truth.get("conflict_keywords", [])
-    if not conflict_keywords and ground_truth.get("difficulty") == "hard":
-        history_keywords: list[str] = ground_truth.get("history_keywords", [])
-        response_keywords: list[str] = ground_truth.get("response_keywords", [])
-        conflict_keywords = history_keywords[:2] or response_keywords[:2]
+    if not conflict_keywords:
+        snapshot = TicketSnapshot.model_validate(ground_truth["snapshot"])
+        policy_version = cast(PolicyVersion, ground_truth["policy_version"])
+        expectations = compute_policy_expectations(snapshot, float(ground_truth["issue_age_hours"]), policy_version)
+        derived_signals: list[list[str]] = []
+
+        if ground_truth.get("expected_flag_fraud") or expectations["requires_fraud_flag"]:
+            fraud_keywords = cast(list[str], ground_truth.get("fraud_keywords", []))
+            derived_signals.append(["fraud", *fraud_keywords[:2]])
+
+        if expectations["requires_escalation"]:
+            escalation_keywords = ["escalation"]
+            latest_text = f"{snapshot.thread[-1].subject} {snapshot.thread[-1].body}".lower()
+            if any(term in latest_text for term in ["legal", "lawyer", "counsel", "lawsuit"]):
+                escalation_keywords.extend(["legal", "lawyer"])
+            elif snapshot.refund_amount is not None:
+                escalation_keywords.extend(["refund", "billing"])
+            derived_signals.append(escalation_keywords)
+
+        if snapshot.sender_tier in {"vip", "premier"}:
+            derived_signals.append([snapshot.sender_tier, "priority"])
+
+        if "suspended" in snapshot.account_flags:
+            derived_signals.append(["suspended", "billing"])
+
+        if snapshot.visible_problem_type:
+            visible_problem_tokens = snapshot.visible_problem_type.replace("_", " ").split()
+            derived_signals.append(visible_problem_tokens)
+
+        if float(ground_truth["issue_age_hours"]) > 72 or ground_truth.get("expected_priority") == "urgent":
+            derived_signals.append(["urgent", "timeline"])
+
+        if ground_truth.get("policy_transition_to"):
+            derived_signals.append(["policy", str(ground_truth["policy_transition_to"])])
+
+        if len(derived_signals) >= 2:
+            conflict_keywords = list(
+                dict.fromkeys(keyword for signal in derived_signals for keyword in signal if keyword)
+            )
     if not conflict_keywords:
         return 1.0
     draft_action = latest_action(actions, "draft_response")
-    draft_text = draft_action.response_text if draft_action and draft_action.response_text else ""
-    reasoning_text = " ".join(action.reasoning for action in actions if action.reasoning)
-    combined = f"{draft_text} {reasoning_text}".lower()
+    escalate_action = latest_action(actions, "escalate")
+    fraud_action = latest_action(actions, "flag_fraud")
+    text_fragments = [
+        draft_action.response_text if draft_action and draft_action.response_text else "",
+        draft_action.reasoning if draft_action and draft_action.reasoning else "",
+        escalate_action.escalation_reason if escalate_action and escalate_action.escalation_reason else "",
+        fraud_action.fraud_reason if fraud_action and fraud_action.fraud_reason else "",
+    ]
+    combined = " ".join(fragment for fragment in text_fragments if fragment).lower()
     hits = sum(1 for keyword in conflict_keywords if keyword.lower() in combined)
     return round(min(1.0, hits / len(conflict_keywords)), 4)
 
@@ -307,7 +381,7 @@ def _sequencing_penalty_factor(actions: list[Action], ground_truth: GroundTruthP
         return 1.0
     if actions and actions[0].action_type == "request_info":
         return 1.0
-    return 0.6 if ground_truth.get("difficulty") == "medium" else 0.35
+    return 0.72 if ground_truth.get("difficulty") == "medium" else 0.35
 
 
 def _categorize_score(actions: list[Action], expected_category: str | None) -> float:

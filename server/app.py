@@ -1,13 +1,15 @@
+"""ASGI entrypoint used by OpenEnv and direct uvicorn launches."""
+
 from __future__ import annotations
 
 from business_policy_env.server import app as app
+from business_policy_env.server_main import main as run_server
+
+__all__ = ["app", "main"]
 
 
 def main() -> None:
-    import uvicorn
-
-    uvicorn.run("server.app:app", host="0.0.0.0", port=7860, log_level="info")
-
+    run_server()
 
 if __name__ == "__main__":
     main()

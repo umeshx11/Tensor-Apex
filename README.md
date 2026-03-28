@@ -125,8 +125,8 @@ From:
 
 Current means (52 scenarios):
 - Easy: `0.8643`
-- Medium: `0.4610`
-- Hard: `0.4086`
+- Medium: `0.4863`
+- Hard: `0.4435`
 
 ## Project Layout
 
