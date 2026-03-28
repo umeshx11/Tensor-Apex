@@ -26,6 +26,7 @@ def get_scenario_choices() -> list[tuple[str, str]]:
 def format_observation(obs: Observation) -> str:
     lines = [
         f"**Scenario:** {obs.scenario_id} [{obs.difficulty}]",
+        f"**Selection mode:** {obs.difficulty_mode}",
         f"**Policy version:** {obs.policy_version}",
         f"**Phase:** {obs.episode_phase}",
         f"**Steps:** {obs.steps_taken}/{obs.max_steps}",
@@ -35,6 +36,8 @@ def format_observation(obs: Observation) -> str:
         f"**Refund amount:** {'$' + str(obs.refund_amount) if obs.refund_amount is not None else 'N/A'}",
         f"**Account flags:** {', '.join(obs.account_flags) if obs.account_flags else 'none'}",
         f"**Hidden account flags:** {obs.hidden_flags}",
+        f"**Specialist consult budget:** {obs.specialist_consult_budget_remaining}",
+        f"**Specialist consults used:** {obs.specialist_consults_used}",
         "",
         "**Latest email:**",
         f"> Subject: {obs.current_email.subject}",
@@ -42,8 +45,21 @@ def format_observation(obs: Observation) -> str:
         "",
         "**Policy rules:**",
     ]
+    if obs.policy_transition_to and obs.steps_until_policy_change is not None:
+        lines.extend(
+            [
+                "",
+                "**Upcoming policy change:**",
+                f"- Switches to `{obs.policy_transition_to}` in {obs.steps_until_policy_change} step(s).",
+            ]
+        )
     for rule in obs.policy_rules:
         lines.append(f"- {rule}")
+    if obs.specialist_notes:
+        lines.append("")
+        lines.append("**Specialist notes:**")
+        for note in obs.specialist_notes:
+            lines.append(f"- {note}")
     if obs.action_history:
         lines.append("")
         lines.append("**Action history:**")
@@ -60,12 +76,12 @@ def _rate_limit(session_id: str) -> None:
     get_session_manager().enforce_rate_limit("gradio-ui", session_id)
 
 
-def reset_episode(scenario_id: str, session_id: str | None) -> tuple[str, str, str, dict[str, Any], str]:
+def reset_episode(scenario_id: str | None, session_id: str | None) -> tuple[str, str, str, dict[str, Any], str]:
     active_session_id = _ensure_session_id(session_id)
     try:
         _rate_limit(active_session_id)
         env = get_session_manager().get_or_create(active_session_id)
-        observation = env.reset(scenario_id=scenario_id)
+        observation = env.reset(scenario_id=scenario_id) if scenario_id else env.reset()
     except RateLimitError as exc:
         return "", "", str(exc), gr.update(interactive=False), active_session_id
     except SessionCapacityError as exc:
@@ -74,7 +90,11 @@ def reset_episode(scenario_id: str, session_id: str | None) -> tuple[str, str, s
     return (
         format_observation(observation),
         "",
-        "Episode reset. Ready for actions.",
+        (
+            "Episode reset. Ready for actions."
+            if scenario_id
+            else "Adaptive episode reset. Ready for actions."
+        ),
         gr.update(interactive=True),
         active_session_id,
     )
@@ -90,6 +110,7 @@ def take_action(
     clarifying_question: str,
     fraud_reason: str,
     snooze_hours: int,
+    specialist_team: str,
     reasoning: str,
 ) -> tuple[str, str, str, str]:
     if not session_id:
@@ -115,6 +136,7 @@ def take_action(
             clarifying_question=clarifying_question or None,
             fraud_reason=fraud_reason or None,
             snooze_hours=snooze_hours or None,
+            specialist_team=specialist_team or None,
         )
     except Exception as exc:  # pragma: no cover - UI validation path
         observation = env.state().get("observation")
@@ -141,7 +163,10 @@ def create_demo() -> gr.Blocks:
         session_state = gr.State("")
 
         gr.Markdown("## Business Policy Compliance & Customer Resolution Environment")
-        gr.Markdown("_Policy-aware agent evaluation. Select a scenario, reset, then step through actions._")
+        gr.Markdown(
+            "_Policy-aware agent evaluation. Select a scenario for a fixed reset, "
+            "or leave it blank to use adaptive difficulty._"
+        )
 
         with gr.Row():
             scenario_dd = gr.Dropdown(choices=get_scenario_choices(), label="Scenario", value=None)
@@ -161,6 +186,7 @@ def create_demo() -> gr.Blocks:
                     "request_info",
                     "flag_fraud",
                     "snooze",
+                    "consult_specialist",
                 ],
                 label="Action type",
             )
@@ -181,6 +207,17 @@ def create_demo() -> gr.Blocks:
         with gr.Row():
             fraud_reason = gr.Textbox(label="Fraud reason (for flag_fraud)")
             snooze_hours = gr.Number(label="Snooze hours (for snooze)", precision=0, value=0)
+            specialist_team = gr.Dropdown(
+                choices=[
+                    "billing_ops",
+                    "technical_ops",
+                    "returns_ops",
+                    "legal_ops",
+                    "customer_success_ops",
+                    "fraud_ops",
+                ],
+                label="Specialist team (for consult_specialist)",
+            )
 
         step_btn = gr.Button("Take action", variant="secondary", interactive=False)
         scores_display = gr.Textbox(label="Component scores", interactive=False)
@@ -203,6 +240,7 @@ def create_demo() -> gr.Blocks:
                 clarifying_question,
                 fraud_reason,
                 snooze_hours,
+                specialist_team,
                 reasoning,
             ],
             outputs=[obs_display, scores_display, status_display, session_state],

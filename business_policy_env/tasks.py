@@ -190,14 +190,21 @@ def _anti_stuffing_factor(
     return round(factor, 4)
 
 
-def _coherence_gate(response_text: str) -> float:
+def _coherence_gate(response_text: str, difficulty: str | None = None) -> float:
     sentences = [segment.strip() for segment in re.split(r"[.!?]", response_text) if len(segment.strip()) > 8]
-    if len(sentences) < 2:
-        return 0.2
     tokens = _tokenize(response_text)
     if not tokens:
         return 0.0
     unique_ratio = len(set(tokens)) / len(tokens)
+    if difficulty == "medium":
+        if len(sentences) < 2:
+            return 0.75 if len(tokens) >= 8 else 0.5
+        if unique_ratio < 0.45:
+            return 0.7
+        return 1.0
+
+    if len(sentences) < 2:
+        return 0.2
     if unique_ratio < 0.45:
         return 0.5
     return 1.0
@@ -232,7 +239,7 @@ def _response_rubric(
         ["sorry", "apolog", "understand", "recogn", "appreciate", "thanks", "noted", "aware"],
     )
     anti_stuffing = _anti_stuffing_factor(response_text, response_keywords, history_keywords)
-    coherence_gate = _coherence_gate(response_text)
+    coherence_gate = _coherence_gate(response_text, str(ground_truth.get("difficulty")))
     heuristic_quality = round(
         0.4 * fact_score + 0.25 * next_step_score + 0.2 * tone_score + 0.15 * history_score,
         4,
@@ -300,7 +307,7 @@ def _sequencing_penalty_factor(actions: list[Action], ground_truth: GroundTruthP
         return 1.0
     if actions and actions[0].action_type == "request_info":
         return 1.0
-    return 0.35
+    return 0.6 if ground_truth.get("difficulty") == "medium" else 0.35
 
 
 def _categorize_score(actions: list[Action], expected_category: str | None) -> float:

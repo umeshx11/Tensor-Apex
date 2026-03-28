@@ -235,6 +235,8 @@ class EnvironmentTests(unittest.TestCase):
     def test_policy_version_can_transition_mid_episode(self) -> None:
         observation = self.env.reset(scenario_id="hard_policy_shift_fraud_upgrade")
         self.assertEqual(observation.policy_version, "v1")
+        self.assertEqual(observation.policy_transition_to, "v2")
+        self.assertEqual(observation.steps_until_policy_change, 3)
         for action in [
             Action(action_type="categorize", reasoning="Billing issue.", category="billing"),
             Action(action_type="set_priority", reasoning="Premier issue.", priority="high"),
@@ -361,6 +363,15 @@ class EnvironmentTests(unittest.TestCase):
         self.assertIn("min_final_score", result["results"]["easy"])
         self.assertIn("max_final_score", result["results"]["easy"])
 
+    def test_rule_baseline_preserves_difficulty_ladder(self) -> None:
+        result = run_baseline(agent_name="rule")
+        easy_score = result["results"]["easy"]["mean_final_score"]
+        medium_score = result["results"]["medium"]["mean_final_score"]
+        hard_score = result["results"]["hard"]["mean_final_score"]
+        self.assertGreater(easy_score, medium_score)
+        self.assertGreater(medium_score, hard_score)
+        self.assertGreater(medium_score - hard_score, 0.04)
+
     def test_hard_conflict_and_ordering_components_reward_better_reasoning(self) -> None:
         scenario = scenario_registry()["hard_concurrent_violations"]
         ground_truth = build_ground_truth_payload(scenario, scenario.initial_snapshot)
@@ -447,6 +458,36 @@ class EnvironmentTests(unittest.TestCase):
         wrong_components = component_scores(wrong_order_actions, ground_truth)
         self.assertGreater(ordered_components["ordering_correctness"], wrong_components["ordering_correctness"])
 
+    def test_consult_specialist_consumes_budget_and_adds_note(self) -> None:
+        observation = self.env.reset(scenario_id="hard_concurrent_violations")
+        self.assertEqual(observation.specialist_consult_budget_remaining, 2)
+        observation, reward, done, info = self.env.step(
+            Action(
+                action_type="consult_specialist",
+                reasoning="Need a legal review before responding.",
+                specialist_team="legal_ops",
+            )
+        )
+        self.assertFalse(done)
+        self.assertLess(reward, 0.05)
+        self.assertEqual(observation.specialist_consult_budget_remaining, 1)
+        self.assertEqual(observation.specialist_consults_used, 1)
+        self.assertTrue(observation.specialist_notes)
+        self.assertEqual(info["reward_breakdown"]["specialist_consult_cost"], -0.05)
+
+    def test_adaptive_reset_selects_harder_tiers_after_strong_recent_scores(self) -> None:
+        adaptive_env = BusinessPolicyComplianceEnv(seed=19)
+        try:
+            first_observation = adaptive_env.reset()
+            self.assertEqual(first_observation.difficulty_mode, "adaptive")
+            self.assertEqual(first_observation.difficulty, "easy")
+            adaptive_env._recent_final_scores.extend([0.88, 0.84, 0.81])  # type: ignore[attr-defined]
+            promoted_observation = adaptive_env.reset()
+            self.assertEqual(promoted_observation.difficulty_mode, "adaptive")
+            self.assertEqual(promoted_observation.difficulty, "hard")
+        finally:
+            adaptive_env.close()
+
     def test_done_branch_reports_episode_complete_for_valid_follow_on_actions(self) -> None:
         self.env.reset(scenario_id="easy_vip_refund")
         for action in [
@@ -528,6 +569,7 @@ class GradioIsolationTests(unittest.TestCase):
             "",
             "",
             0,
+            "",
             "Setting priority for the first UI session.",
         )
         manager = get_session_manager()

@@ -180,7 +180,7 @@ class LLMAgent:
     SYSTEM_PROMPT = """
 You are a customer support policy agent. Given a ticket observation, choose ONE action.
 Available actions: categorize, set_priority, draft_response, escalate,
-                   mark_spam, request_info, flag_fraud, snooze.
+                   mark_spam, request_info, flag_fraud, snooze, consult_specialist.
 
 Reply ONLY with valid JSON matching this schema:
 {
@@ -192,7 +192,8 @@ Reply ONLY with valid JSON matching this schema:
   "escalation_reason": null,
   "clarifying_question": null,
   "fraud_reason": null,
-  "snooze_hours": null
+  "snooze_hours": null,
+  "specialist_team": null
 }
 """.strip()
 

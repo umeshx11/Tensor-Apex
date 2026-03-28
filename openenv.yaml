@@ -27,6 +27,7 @@ actions:
   - request_info
   - flag_fraud
   - snooze
+  - consult_specialist
 baseline:
   command: python baseline.py --agent rule
 tasks:
@@ -36,3 +37,5 @@ tasks:
     objective: Ambiguous tickets that require request_info before resolution.
   - name: hard
     objective: Multi-turn threads with temporal pressure, policy rules, and history-aware responses.
+  - name: adaptive
+    objective: Select the next tier based on recent agent performance when no explicit task is requested.

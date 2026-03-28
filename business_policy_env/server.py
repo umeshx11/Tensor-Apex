@@ -58,6 +58,7 @@ def tasks(request: Request, x_session_id: str | None = Header(default=None)) -> 
     session_id = _session_or_default(x_session_id)
     _enforce_rate_limit(request, session_id)
     return {
+        "adaptive": [],
         "easy": scenario_ids_for_task("easy"),
         "medium": scenario_ids_for_task("medium"),
         "hard": scenario_ids_for_task("hard"),

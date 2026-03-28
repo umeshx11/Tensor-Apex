@@ -12,6 +12,7 @@ FRAUD_MISSED_PENALTY = -0.15
 REDUNDANCY_PENALTY = 0.05
 EFFICIENCY_BONUS = 0.1
 INVALID_ACTION_REWARD = -0.1
+CONSULT_SPECIALIST_COST = -0.05
 
 
 def _clamp_terminal_reward(value: float) -> float:
@@ -51,16 +52,20 @@ def shaped_reward(
     policy_violations: list[str],
     *,
     snooze_sla_violations: int,
+    specialist_consults_used: int,
     fraud_expected: bool,
 ) -> RewardBreakdown:
     partial_score = grade_actions(actions, ground_truth)
     policy_penalty = POLICY_VIOLATION_PENALTY if policy_violations else 0.0
     snooze_penalty = round(SNOOZE_SLA_PENALTY * snooze_sla_violations, 4)
+    consult_penalty = round(CONSULT_SPECIALIST_COST * specialist_consults_used, 4)
     components = {"valid_action": VALID_ACTION_REWARD}
     if policy_penalty:
         components["policy_penalty"] = policy_penalty
     if snooze_penalty:
         components["snooze_sla_penalty"] = snooze_penalty
+    if consult_penalty:
+        components["specialist_consult_cost"] = consult_penalty
 
     if done:
         efficiency_bonus = EFFICIENCY_BONUS if len(actions) <= max_steps / 2 else 0.0
@@ -73,6 +78,7 @@ def shaped_reward(
             - redundancy_penalty
             + policy_penalty
             + snooze_penalty
+            + consult_penalty
             + fraud_penalty
         )
         components["final_score"] = partial_score
@@ -85,7 +91,9 @@ def shaped_reward(
         explanation = "Final reward includes grader score, bonuses, and policy/fraud/snooze penalties."
         return RewardBreakdown(reward=final_reward, components=components, explanation=explanation)
 
-    intermediate_reward = _clamp_step_reward(VALID_ACTION_REWARD + partial_score + policy_penalty + snooze_penalty)
+    intermediate_reward = _clamp_step_reward(
+        VALID_ACTION_REWARD + partial_score + policy_penalty + snooze_penalty + consult_penalty
+    )
     components["partial_score"] = partial_score
     explanation = "Intermediate reward includes valid-action bonus, partial score, and immediate penalties."
     return RewardBreakdown(reward=intermediate_reward, components=components, explanation=explanation)

@@ -4,9 +4,9 @@ import hashlib
 import json
 import random
 import sqlite3
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from pydantic import ValidationError
 
@@ -18,10 +18,12 @@ from .models import (
     EpisodePhase,
     Observation,
     PolicyVersion,
+    SpecialistTeam,
+    TaskName,
     TaskScenario,
     TicketSnapshot,
 )
-from .policies import check_policy_violations, policy_rules_for
+from .policies import check_policy_violations, compute_policy_expectations, policy_rules_for
 from .rewards import current_progress, invalid_action_breakdown, shaped_reward
 from .tasks import (
     build_ground_truth_payload,
@@ -42,6 +44,7 @@ class BusinessPolicyComplianceEnv:
             task: random.Random(self._stable_seed(f"shuffle:{task}")) for task in self._task_family_ids
         }
         self._variant_counters: dict[str, int] = defaultdict(int)
+        self._recent_final_scores: deque[float] = deque(maxlen=6)
         self._connection = self._create_connection()
         self.current_scenario: TaskScenario | None = None
         self.action_history: list[ActionRecord] = []
@@ -50,6 +53,10 @@ class BusinessPolicyComplianceEnv:
         self._simulated_offset_hours = 0.0
         self._snooze_sla_violations = 0
         self._active_policy_version: PolicyVersion = "v1"
+        self._difficulty_mode: str = "task"
+        self._specialist_consults_used = 0
+        self._specialist_consult_budget_remaining = 0
+        self._specialist_notes: list[str] = []
         self._last_final_score: float | None = None
         self.done = False
 
@@ -85,7 +92,25 @@ class BusinessPolicyComplianceEnv:
         self._connection = self._create_connection()
 
     def available_tasks(self) -> dict[str, list[str]]:
-        return {task: list(ids) for task, ids in self._task_family_ids.items()}
+        tasks: dict[str, list[str]] = {task: list(ids) for task, ids in self._task_family_ids.items()}
+        tasks["adaptive"] = []
+        return tasks
+
+    def _initial_specialist_budget(self, difficulty: Difficulty) -> int:
+        if difficulty == "hard":
+            return 2
+        return 1
+
+    def _select_adaptive_task(self) -> Difficulty:
+        if not self._recent_final_scores:
+            return "easy"
+        window = list(self._recent_final_scores)[-3:]
+        trailing_mean = sum(window) / len(window)
+        if trailing_mean >= 0.78:
+            return "hard"
+        if trailing_mean >= 0.5:
+            return "medium"
+        return "easy"
 
     def _next_family_id(self, task_name: Difficulty) -> str:
         bag = self._shuffle_bags[task_name]
@@ -136,10 +161,45 @@ class BusinessPolicyComplianceEnv:
     def _policy_version(self) -> PolicyVersion:
         return self._active_policy_version
 
+    def _steps_until_policy_change(self) -> int | None:
+        scenario = self._active_snapshot()
+        if scenario.policy_transition_step is None or scenario.policy_transition_to is None:
+            return None
+        remaining = scenario.policy_transition_step - len(self.action_history)
+        return remaining if remaining > 0 else None
+
     def _visible_account_flags(self, snapshot: TicketSnapshot) -> list[str]:
         scenario = self._active_snapshot()
         hidden = set(scenario.hidden_account_flags)
         return [flag for flag in snapshot.account_flags if flag not in hidden]
+
+    def _build_specialist_note(
+        self,
+        specialist_team: SpecialistTeam,
+        snapshot: TicketSnapshot,
+        policy_version: PolicyVersion,
+    ) -> str:
+        expectations = compute_policy_expectations(snapshot, self._issue_age_hours(), policy_version)
+        team_notes = {
+            "billing_ops": "Billing ops recommends verifying invoice history and adjustment rules before closure.",
+            "technical_ops": (
+                "Technical ops recommends confirming the product surface, timeline, and any recent changes."
+            ),
+            "returns_ops": "Returns ops recommends confirming the fulfillment state and desired remedy before closure.",
+            "legal_ops": "Legal ops recommends preserving the thread and escalating if legal language is present.",
+            "customer_success_ops": (
+                "Customer success recommends acknowledging the history and clarifying the desired outcome."
+            ),
+            "fraud_ops": "Fraud ops recommends checking account risk indicators before any resolution step.",
+        }
+        signals: list[str] = []
+        if expectations["requires_fraud_flag"]:
+            signals.append("Fraud review is likely relevant.")
+        if expectations["requires_escalation"]:
+            signals.append("Escalation may be required before closure.")
+        if snapshot.visible_problem_type:
+            signals.append(f"Primary surface appears to be {snapshot.visible_problem_type.replace('_', ' ')}.")
+        return " ".join([team_notes[specialist_team], *signals]).strip()
 
     def _maybe_transition_policy_version(self) -> None:
         scenario = self._active_snapshot()
@@ -191,9 +251,16 @@ class BusinessPolicyComplianceEnv:
             action_history=self.action_history,
             policy_rules=policy_rules_for(self._policy_version()),
             policy_version=self._policy_version(),
+            policy_transition_step=scenario.policy_transition_step,
+            policy_transition_to=scenario.policy_transition_to,
+            steps_until_policy_change=self._steps_until_policy_change(),
             task_objective=scenario.objective,
             clarification_received=self.clarification_received,
             episode_phase=self.episode_phase,
+            difficulty_mode="adaptive" if self._difficulty_mode == "adaptive" else "task",
+            specialist_consult_budget_remaining=self._specialist_consult_budget_remaining,
+            specialist_consults_used=self._specialist_consults_used,
+            specialist_notes=list(self._specialist_notes),
         )
 
     def _completion_reached(self) -> bool:
@@ -204,7 +271,15 @@ class BusinessPolicyComplianceEnv:
 
     def _advance_phase(self, action: Action) -> None:
         phase = self.episode_phase
-        resolving_actions = {"categorize", "set_priority", "escalate", "flag_fraud", "draft_response", "mark_spam"}
+        resolving_actions = {
+            "categorize",
+            "set_priority",
+            "escalate",
+            "flag_fraud",
+            "draft_response",
+            "mark_spam",
+            "consult_specialist",
+        }
 
         if phase == EpisodePhase.initial:
             if action.action_type == "request_info":
@@ -241,14 +316,25 @@ class BusinessPolicyComplianceEnv:
         )
         return request_info_quality(action, ground_truth) >= 0.5
 
-    def reset(self, task_name: Difficulty | None = None, scenario_id: str | None = None) -> Observation:
-        self.current_scenario = self._select_scenario(task_name, scenario_id)
+    def reset(self, task_name: TaskName | None = None, scenario_id: str | None = None) -> Observation:
+        selected_task: Difficulty | None = None
+        if task_name in {"easy", "medium", "hard"}:
+            selected_task = cast(Difficulty, task_name)
+        self._difficulty_mode = "task"
+        if scenario_id is None and task_name in {None, "adaptive"}:
+            selected_task = self._select_adaptive_task()
+            self._difficulty_mode = "adaptive"
+
+        self.current_scenario = self._select_scenario(selected_task, scenario_id)
         self.action_history = []
         self.clarification_received = False
         self.episode_phase = EpisodePhase.initial
         self._simulated_offset_hours = 0.0
         self._snooze_sla_violations = 0
         self._active_policy_version = self.current_scenario.policy_version
+        self._specialist_consults_used = 0
+        self._specialist_consult_budget_remaining = self._initial_specialist_budget(self.current_scenario.difficulty)
+        self._specialist_notes = []
         self._last_final_score = None
         self.done = False
         self._reset_connection()
@@ -312,6 +398,29 @@ class BusinessPolicyComplianceEnv:
             prior_actions=prior_actions,
         )
 
+        if action.action_type == "consult_specialist":
+            if self._specialist_consult_budget_remaining <= 0:
+                observation = self._observation()
+                breakdown = invalid_action_breakdown("No specialist consult budget remaining.")
+                info_consult_denied: dict[str, Any] = {
+                    "valid_action": True,
+                    "action_accepted": False,
+                    "episode_complete": False,
+                    "final_score": None,
+                    "partial_score": None,
+                    "policy_violations": [],
+                    "reward_breakdown": breakdown.components,
+                    "component_scores": {},
+                    "explanation": breakdown.explanation,
+                }
+                return observation, breakdown.reward, False, info_consult_denied
+            assert action.specialist_team is not None
+            self._specialist_consult_budget_remaining -= 1
+            self._specialist_consults_used += 1
+            self._specialist_notes.append(
+                self._build_specialist_note(action.specialist_team, snapshot_before, active_policy_version)
+            )
+
         if action.action_type == "snooze" and action.snooze_hours:
             self._simulated_offset_hours += float(action.snooze_hours)
             new_age = self._issue_age_hours()
@@ -350,11 +459,13 @@ class BusinessPolicyComplianceEnv:
             scenario.max_steps,
             policy_violations,
             snooze_sla_violations=self._snooze_sla_violations,
+            specialist_consults_used=self._specialist_consults_used,
             fraud_expected=scenario.ground_truth.expected_flag_fraud,
         )
         progress_score, components = current_progress(actions, grading_payload)
         if self.done:
             self._last_final_score = progress_score
+            self._recent_final_scores.append(progress_score)
         else:
             self._maybe_transition_policy_version()
         observation = self._observation()
@@ -400,6 +511,9 @@ class BusinessPolicyComplianceEnv:
                 "done": self.done,
                 "steps_taken": len(self.action_history),
                 "active_policy_version": self._policy_version(),
+                "difficulty_mode": self._difficulty_mode,
+                "specialist_consults_used": self._specialist_consults_used,
+                "specialist_consult_budget_remaining": self._specialist_consult_budget_remaining,
             },
         }
 
@@ -436,5 +550,6 @@ class BusinessPolicyComplianceEnv:
             f"Scenario: {observation.scenario_id} ({observation.difficulty}) | "
             f"Phase: {observation.episode_phase} | Step {observation.steps_taken}/{observation.max_steps}\n"
             f"Subject: {observation.current_email.subject}\n"
-            f"Policy: {observation.policy_version} | Age: {observation.issue_age_hours}h"
+            f"Policy: {observation.policy_version} | Age: {observation.issue_age_hours}h | "
+            f"Consult budget: {observation.specialist_consult_budget_remaining}"
         )

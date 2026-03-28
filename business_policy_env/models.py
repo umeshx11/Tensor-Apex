@@ -8,6 +8,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Category = Literal["billing", "technical_support", "returns", "legal", "customer_success", "spam"]
 Priority = Literal["low", "medium", "high", "urgent"]
+SpecialistTeam = Literal[
+    "billing_ops",
+    "technical_ops",
+    "returns_ops",
+    "legal_ops",
+    "customer_success_ops",
+    "fraud_ops",
+]
 ActionType = Literal[
     "categorize",
     "set_priority",
@@ -17,8 +25,10 @@ ActionType = Literal[
     "request_info",
     "flag_fraud",
     "snooze",
+    "consult_specialist",
 ]
 Difficulty = Literal["easy", "medium", "hard"]
+TaskName = Literal["easy", "medium", "hard", "adaptive"]
 SenderTier = Literal["standard", "vip", "premier"]
 PolicyVersion = Literal["v1", "v2"]
 
@@ -106,6 +116,7 @@ class Action(BaseModel):
     clarifying_question: str | None = None
     fraud_reason: str | None = None
     snooze_hours: int | None = None
+    specialist_team: SpecialistTeam | None = None
 
     @model_validator(mode="after")
     def validate_action_payload(self) -> Action:
@@ -117,6 +128,7 @@ class Action(BaseModel):
             "request_info": self.clarifying_question,
             "flag_fraud": self.fraud_reason,
             "snooze": self.snooze_hours,
+            "consult_specialist": self.specialist_team,
         }
         value = required_fields.get(self.action_type)
         if self.action_type in required_fields and value in (None, ""):
@@ -128,6 +140,7 @@ class Action(BaseModel):
                 "request_info": "clarifying_question",
                 "flag_fraud": "fraud_reason",
                 "snooze": "snooze_hours",
+                "consult_specialist": "specialist_team",
             }[self.action_type]
             raise ValueError(f"{field_name} is required for action_type={self.action_type}")
 
@@ -164,9 +177,16 @@ class Observation(BaseModel):
     action_history: list[ActionRecord]
     policy_rules: list[str]
     policy_version: PolicyVersion = "v1"
+    policy_transition_step: int | None = None
+    policy_transition_to: PolicyVersion | None = None
+    steps_until_policy_change: int | None = None
     task_objective: str
     clarification_received: bool = False
     episode_phase: EpisodePhase = EpisodePhase.initial
+    difficulty_mode: Literal["task", "adaptive"] = "task"
+    specialist_consult_budget_remaining: int = 0
+    specialist_consults_used: int = 0
+    specialist_notes: list[str] = Field(default_factory=list)
 
 
 class StepInfo(BaseModel):
@@ -194,7 +214,7 @@ class StepResult(BaseModel):
 class ResetRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    task_name: Difficulty | None = None
+    task_name: TaskName | None = None
     scenario_id: str | None = None
 
 
