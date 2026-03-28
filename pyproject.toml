@@ -26,6 +26,9 @@ dev = [
 openai = [
   "openai>=2.7.2",
 ]
+llm = [
+  "anthropic>=0.39.0",
+]
 
 [project.scripts]
 server = "business_policy_env.server_main:main"

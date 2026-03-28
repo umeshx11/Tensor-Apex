@@ -48,7 +48,7 @@ class BusinessPolicyComplianceEnv:
         self.clarification_received = False
         self.episode_phase = EpisodePhase.initial
         self._simulated_offset_hours = 0.0
-        self._snooze_crossed_sla = False
+        self._snooze_sla_violations = 0
         self._active_policy_version: PolicyVersion = "v1"
         self._last_final_score: float | None = None
         self.done = False
@@ -247,7 +247,7 @@ class BusinessPolicyComplianceEnv:
         self.clarification_received = False
         self.episode_phase = EpisodePhase.initial
         self._simulated_offset_hours = 0.0
-        self._snooze_crossed_sla = False
+        self._snooze_sla_violations = 0
         self._active_policy_version = self.current_scenario.policy_version
         self._last_final_score = None
         self.done = False
@@ -316,7 +316,9 @@ class BusinessPolicyComplianceEnv:
             self._simulated_offset_hours += float(action.snooze_hours)
             new_age = self._issue_age_hours()
             if previous_age <= 72 < new_age:
-                self._snooze_crossed_sla = True
+                self._snooze_sla_violations += 1
+            elif previous_age > 72:
+                self._snooze_sla_violations += 1
 
         record = ActionRecord(
             step_index=len(self.action_history) + 1,
@@ -347,7 +349,7 @@ class BusinessPolicyComplianceEnv:
             self.done,
             scenario.max_steps,
             policy_violations,
-            snooze_crossed_sla=self._snooze_crossed_sla,
+            snooze_sla_violations=self._snooze_sla_violations,
             fraud_expected=scenario.ground_truth.expected_flag_fraud,
         )
         progress_score, components = current_progress(actions, grading_payload)
@@ -394,7 +396,7 @@ class BusinessPolicyComplianceEnv:
                 "clarification_received": self.clarification_received,
                 "episode_phase": self.episode_phase,
                 "simulated_offset_hours": self._simulated_offset_hours,
-                "snooze_crossed_sla": self._snooze_crossed_sla,
+                "snooze_sla_violations": self._snooze_sla_violations,
                 "done": self.done,
                 "steps_taken": len(self.action_history),
                 "active_policy_version": self._policy_version(),

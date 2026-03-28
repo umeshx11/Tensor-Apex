@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from statistics import mean
 from typing import Any, Protocol
 
@@ -173,6 +174,55 @@ class OpenAIBaselineAgent:
         return Action.model_validate_json(response.output_text)
 
 
+class LLMAgent:
+    """Anthropic-powered agent baseline for stronger task evaluation."""
+
+    SYSTEM_PROMPT = """
+You are a customer support policy agent. Given a ticket observation, choose ONE action.
+Available actions: categorize, set_priority, draft_response, escalate,
+                   mark_spam, request_info, flag_fraud, snooze.
+
+Reply ONLY with valid JSON matching this schema:
+{
+  "action_type": "<action>",
+  "reasoning": "<why>",
+  "category": null,
+  "priority": null,
+  "response_text": null,
+  "escalation_reason": null,
+  "clarifying_question": null,
+  "fraud_reason": null,
+  "snooze_hours": null
+}
+""".strip()
+
+    def __init__(self, model: str = "claude-3-5-sonnet-latest") -> None:
+        try:
+            import anthropic
+        except ImportError as exc:  # pragma: no cover - optional path
+            raise RuntimeError("anthropic package is not installed.") from exc
+
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY is required for the LLM baseline.")
+
+        self._client = anthropic.Anthropic(api_key=api_key)
+        self._model = model
+
+    def next_action(self, observation: Observation) -> Action:  # pragma: no cover - optional path
+        observation_payload = observation.model_dump(mode="json")
+        observation_text = json.dumps(observation_payload, indent=2)
+        message = self._client.messages.create(
+            model=self._model,
+            max_tokens=512,
+            system=self.SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": f"Observation:\n{observation_text}"}],
+        )
+        raw = message.content[0].text.strip()
+        raw = re.sub(r"^```json\s*|```$", "", raw, flags=re.MULTILINE).strip()
+        return Action.model_validate_json(raw)
+
+
 def run_episode(env: BusinessPolicyComplianceEnv, agent: _Agent, scenario_id: str) -> dict[str, Any]:
     observation = env.reset(scenario_id=scenario_id)
     reward = 0.0
@@ -189,17 +239,31 @@ def run_episode(env: BusinessPolicyComplianceEnv, agent: _Agent, scenario_id: st
     }
 
 
+def run_tier(env: BusinessPolicyComplianceEnv, agent: _Agent, task_name: str) -> dict[str, Any]:
+    task_results = [run_episode(env, agent, scenario.scenario_id) for scenario in scenarios_for_task(task_name)]
+    scores = [result["final_score"] for result in task_results]
+    return {
+        "mean_final_score": round(mean(scores), 4),
+        "min_final_score": round(min(scores), 4),
+        "max_final_score": round(max(scores), 4),
+        "scenario_count": len(task_results),
+        "scenarios": task_results,
+    }
+
+
 def run_baseline(agent_name: str = "rule", model: str = "gpt-4.1-mini") -> dict[str, Any]:
     env = BusinessPolicyComplianceEnv()
-    agent = RuleBasedAgent() if agent_name == "rule" else OpenAIBaselineAgent(model=model)
+    if agent_name == "rule":
+        agent: _Agent = RuleBasedAgent()
+    elif agent_name == "openai":
+        agent = OpenAIBaselineAgent(model=model)
+    else:
+        llm_model = "claude-3-5-sonnet-latest" if model == "gpt-4.1-mini" else model
+        agent = LLMAgent(model=llm_model)
     summary: dict[str, Any] = {"agent": agent_name, "results": {}}
 
     for task_name in ["easy", "medium", "hard"]:
-        task_results = [run_episode(env, agent, scenario.scenario_id) for scenario in scenarios_for_task(task_name)]
-        summary["results"][task_name] = {
-            "mean_final_score": round(mean(result["final_score"] for result in task_results), 4),
-            "scenarios": task_results,
-        }
+        summary["results"][task_name] = run_tier(env, agent, task_name)
 
     return summary
 
@@ -208,7 +272,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run baseline agents against the Business Policy Compliance environment."
     )
-    parser.add_argument("--agent", choices=["rule", "openai"], default="rule")
+    parser.add_argument("--agent", choices=["rule", "openai", "llm"], default="rule")
     parser.add_argument("--model", default="gpt-4.1-mini")
     args = parser.parse_args()
     print(json.dumps(run_baseline(agent_name=args.agent, model=args.model), indent=2))

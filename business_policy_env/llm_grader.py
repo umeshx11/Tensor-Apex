@@ -40,8 +40,14 @@ def _extract_content_text(payload: dict[str, Any]) -> str:
     return ""
 
 
-def score_response_with_optional_llm(response_text: str, ground_truth: dict[str, Any]) -> float | None:
-    if not _llm_judge_enabled():
+def score_response_with_optional_llm(
+    response_text: str,
+    ground_truth: dict[str, Any],
+    *,
+    force: bool = False,
+) -> float | None:
+    difficulty = ground_truth.get("difficulty")
+    if not force and difficulty != "hard" and not _llm_judge_enabled():
         return None
 
     api_key = os.getenv("JUDGE_API_KEY")

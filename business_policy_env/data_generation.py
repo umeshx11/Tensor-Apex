@@ -42,6 +42,8 @@ class ScenarioTemplate:
     response_keywords: list[str]
     history_keywords: list[str]
     clarification_keywords: list[str]
+    conflict_keywords: list[str] = field(default_factory=list)
+    required_action_order: list[ActionType] = field(default_factory=list)
     clarification_body: str | None = None
     legal_language: bool = False
     suspended_account: bool = False
@@ -702,6 +704,8 @@ HARD_TEMPLATES: list[ScenarioTemplate] = [
         response_keywords=["fraud", "escalated", "billing", "urgent"],
         history_keywords=["unauthorized", "legal", "suspended"],
         clarification_keywords=[],
+        conflict_keywords=["fraud", "legal", "suspended"],
+        required_action_order=["flag_fraud", "escalate", "draft_response"],
         legal_language=True,
         suspended_account=True,
         expected_flag_fraud=True,
@@ -1139,6 +1143,8 @@ EXTENDED_HARD_TEMPLATES: list[ScenarioTemplate] = [
         response_keywords=["fraud", "escalated", "duplicate charge", "review"],
         history_keywords=["unauthorized", "legal counsel", "today"],
         clarification_keywords=[],
+        conflict_keywords=["fraud", "billing", "legal"],
+        required_action_order=["flag_fraud", "escalate", "draft_response"],
         expected_flag_fraud=True,
         fraud_keywords=["unauthorized", "newly added card", "fraud review"],
         expected_escalation_reason="Policy escalation required by legal pressure and high-value billing risk.",
@@ -1195,6 +1201,8 @@ EXTENDED_HARD_TEMPLATES: list[ScenarioTemplate] = [
         response_keywords=["fraud", "review", "today", "account"],
         history_keywords=["suspicious card", "premier workspace"],
         clarification_keywords=[],
+        conflict_keywords=["fraud", "premier", "today"],
+        required_action_order=["flag_fraud", "draft_response"],
         expected_flag_fraud=True,
         fraud_keywords=["suspicious card", "failed top-up"],
         policy_version="v1",
@@ -1225,6 +1233,8 @@ EXTENDED_HARD_TEMPLATES: list[ScenarioTemplate] = [
         response_keywords=["review", "order", "investigate"],
         history_keywords=["cancelled", "shipped"],
         clarification_keywords=[],
+        conflict_keywords=["cancelled", "shipped", "records"],
+        required_action_order=["flag_fraud", "draft_response"],
         expected_flag_fraud=True,
         fraud_keywords=["cancelled", "records are wrong", "shipped"],
         policy_version="v2",
@@ -1281,6 +1291,8 @@ EXTENDED_HARD_TEMPLATES: list[ScenarioTemplate] = [
         response_keywords=["review", "fraud", "billing"],
         history_keywords=["payment cards", "reversals"],
         clarification_keywords=[],
+        conflict_keywords=["fraud", "billing", "reversals"],
+        required_action_order=["flag_fraud", "draft_response"],
         expected_flag_fraud=True,
         fraud_keywords=["reversals", "payment cards"],
         policy_version="v2",
@@ -1310,6 +1322,8 @@ EXTENDED_HARD_TEMPLATES: list[ScenarioTemplate] = [
         response_keywords=["migration", "today", "escalated", "refund"],
         history_keywords=["lost a full day", "right now"],
         clarification_keywords=[],
+        conflict_keywords=["migration", "refund", "today"],
+        required_action_order=["escalate", "draft_response"],
         expected_escalation_reason="Refund exceeds $500.",
         policy_version="v2",
         refund_range=(680.0, 860.0),
@@ -1338,6 +1352,8 @@ EXTENDED_HARD_TEMPLATES: list[ScenarioTemplate] = [
         response_keywords=["billing", "restore", "escalated", "contract"],
         history_keywords=["locked out", "duplicate renewal", "today"],
         clarification_keywords=[],
+        conflict_keywords=["billing", "contract", "access"],
+        required_action_order=["escalate", "draft_response"],
         legal_language=True,
         suspended_account=True,
         expected_escalation_reason="Policy escalation required by legal and high-value billing risk.",
@@ -1515,6 +1531,8 @@ class ScenarioFactory:
                 clarification_keywords=t.clarification_keywords,
                 response_keywords=t.response_keywords,
                 history_keywords=t.history_keywords,
+                conflict_keywords=t.conflict_keywords,
+                required_action_order=t.required_action_order,
                 completion_action_types=completion_actions,
                 ambiguous=t.requires_request_info,
             ),

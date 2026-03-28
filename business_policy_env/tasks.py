@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 from .data_generation import build_scenarios
 from .llm_grader import score_response_with_optional_llm
-from .models import Action, PolicyVersion, TaskScenario, TicketSnapshot
+from .models import Action, ActionType, PolicyVersion, TaskScenario, TicketSnapshot
 from .policies import policies_satisfied
 
 GroundTruthPayload = dict[str, Any]
@@ -35,6 +35,7 @@ FILLER_PATTERNS = re.compile(
     r"^(can you (share|provide|tell)|please (confirm|clarify)|can you clarify|please share)\b.*$",
     re.IGNORECASE,
 )
+LIST_PATTERN = re.compile(r"\b(\w+,\s*){3,}\w+\b")
 QUESTION_TOPIC_WORDS = {
     "invoice",
     "charge",
@@ -53,6 +54,7 @@ QUESTION_TOPIC_WORDS = {
     "outage",
     "plan",
 }
+AGENT_VERBS = {"can", "will", "do", "is", "are", "have", "need", "could", "would"}
 
 
 def build_ground_truth_payload(
@@ -77,6 +79,8 @@ def build_ground_truth_payload(
         "clarification_keywords": scenario.ground_truth.clarification_keywords,
         "response_keywords": scenario.ground_truth.response_keywords,
         "history_keywords": scenario.ground_truth.history_keywords,
+        "conflict_keywords": scenario.ground_truth.conflict_keywords,
+        "required_action_order": scenario.ground_truth.required_action_order,
         "completion_action_types": scenario.ground_truth.completion_action_types,
         "ambiguous": scenario.ground_truth.ambiguous,
         "snapshot": snapshot.model_dump(mode="json"),
@@ -115,9 +119,15 @@ def is_substantive_question(text: str | None) -> bool:
     stripped = text.strip()
     if FILLER_PATTERNS.match(stripped):
         return False
+    if LIST_PATTERN.search(stripped):
+        return False
     tokens = _tokenize(text)
-    has_topic = bool(set(tokens) & QUESTION_TOPIC_WORDS)
-    return len(tokens) >= 7 and has_topic and "?" in stripped
+    unique_tokens = set(tokens)
+    topic_hit_count = len(unique_tokens & QUESTION_TOPIC_WORDS)
+    if topic_hit_count < 2:
+        return False
+    has_verb = bool(unique_tokens & AGENT_VERBS)
+    return len(tokens) >= 10 and has_verb and "?" in stripped
 
 
 def request_info_quality(action: Action | None, ground_truth: GroundTruthPayload) -> float:
@@ -180,6 +190,19 @@ def _anti_stuffing_factor(
     return round(factor, 4)
 
 
+def _coherence_gate(response_text: str) -> float:
+    sentences = [segment.strip() for segment in re.split(r"[.!?]", response_text) if len(segment.strip()) > 8]
+    if len(sentences) < 2:
+        return 0.2
+    tokens = _tokenize(response_text)
+    if not tokens:
+        return 0.0
+    unique_ratio = len(set(tokens)) / len(tokens)
+    if unique_ratio < 0.45:
+        return 0.5
+    return 1.0
+
+
 def _response_rubric(
     response_text: str | None,
     response_keywords: list[str],
@@ -193,6 +216,7 @@ def _response_rubric(
             "next_step_actionability": 0.0,
             "tone_acknowledgment": 0.0,
             "anti_stuffing": 0.0,
+            "coherence_gate": 0.0,
             "llm_judge_used": 0.0,
             "response_quality": 0.0,
         }
@@ -208,21 +232,67 @@ def _response_rubric(
         ["sorry", "apolog", "understand", "recogn", "appreciate", "thanks", "noted", "aware"],
     )
     anti_stuffing = _anti_stuffing_factor(response_text, response_keywords, history_keywords)
+    coherence_gate = _coherence_gate(response_text)
     heuristic_quality = round(
         0.4 * fact_score + 0.25 * next_step_score + 0.2 * tone_score + 0.15 * history_score,
         4,
     )
-    llm_score = score_response_with_optional_llm(response_text, ground_truth)
-    response_quality = round(((llm_score if llm_score is not None else heuristic_quality) * anti_stuffing), 4)
+    llm_score = score_response_with_optional_llm(
+        response_text,
+        ground_truth,
+        force=(ground_truth.get("difficulty") == "hard"),
+    )
+    response_quality = round(
+        (llm_score if llm_score is not None else heuristic_quality) * anti_stuffing * coherence_gate,
+        4,
+    )
     return {
         "case_specific_facts": round(fact_score, 4),
         "history_acknowledgment": round(history_score, 4),
         "next_step_actionability": round(next_step_score, 4),
         "tone_acknowledgment": round(tone_score, 4),
         "anti_stuffing": anti_stuffing,
+        "coherence_gate": round(coherence_gate, 4),
         "llm_judge_used": 1.0 if llm_score is not None else 0.0,
         "response_quality": response_quality,
     }
+
+
+def _contradiction_detection_score(actions: list[Action], ground_truth: GroundTruthPayload) -> float:
+    conflict_keywords: list[str] = ground_truth.get("conflict_keywords", [])
+    if not conflict_keywords and ground_truth.get("difficulty") == "hard":
+        history_keywords: list[str] = ground_truth.get("history_keywords", [])
+        response_keywords: list[str] = ground_truth.get("response_keywords", [])
+        conflict_keywords = history_keywords[:2] or response_keywords[:2]
+    if not conflict_keywords:
+        return 1.0
+    draft_action = latest_action(actions, "draft_response")
+    draft_text = draft_action.response_text if draft_action and draft_action.response_text else ""
+    reasoning_text = " ".join(action.reasoning for action in actions if action.reasoning)
+    combined = f"{draft_text} {reasoning_text}".lower()
+    hits = sum(1 for keyword in conflict_keywords if keyword.lower() in combined)
+    return round(min(1.0, hits / len(conflict_keywords)), 4)
+
+
+def _ordering_correctness_score(actions: list[Action], ground_truth: GroundTruthPayload) -> float:
+    required_order = cast(list[ActionType], ground_truth.get("required_action_order", []))
+    if not required_order and ground_truth.get("difficulty") == "hard":
+        if ground_truth.get("expected_flag_fraud") and ground_truth.get("expected_escalation"):
+            required_order = ["flag_fraud", "escalate", "draft_response"]
+        elif ground_truth.get("expected_flag_fraud"):
+            required_order = ["flag_fraud", "draft_response"]
+        elif ground_truth.get("expected_escalation"):
+            required_order = ["escalate", "draft_response"]
+    if not required_order:
+        return 1.0
+    action_types = [action.action_type for action in actions]
+    positions: list[int] = []
+    for required in required_order:
+        try:
+            positions.append(action_types.index(required))
+        except ValueError:
+            return 0.0
+    return 1.0 if positions == sorted(positions) else 0.3
 
 
 def _sequencing_penalty_factor(actions: list[Action], ground_truth: GroundTruthPayload) -> float:
@@ -331,6 +401,7 @@ def medium_components(actions: list[Action], ground_truth: GroundTruthPayload) -
         "next_step_actionability": response_rubric["next_step_actionability"],
         "tone_acknowledgment": response_rubric["tone_acknowledgment"],
         "anti_stuffing": response_rubric["anti_stuffing"],
+        "coherence_gate": response_rubric["coherence_gate"],
         "sequence_penalty_factor": _sequencing_penalty_factor(actions, ground_truth),
         "fraud_handling": _fraud_score(actions, bool(ground_truth["expected_flag_fraud"])),
     }
@@ -342,8 +413,10 @@ def hard_grader(actions: list[Action], ground_truth: GroundTruthPayload) -> floa
         0.1 * components["temporal_reasoning"]
         + 0.1 * components["policy_compliance"]
         + 0.1 * components["escalation_accuracy"]
-        + 0.25 * components["history_acknowledgment"]
-        + 0.35 * components["response_completeness"]
+        + 0.1 * components["contradiction_detection"]
+        + 0.05 * components["ordering_correctness"]
+        + 0.2 * components["history_acknowledgment"]
+        + 0.25 * components["response_completeness"]
         + 0.1 * components["fraud_handling"],
         4,
     )
@@ -369,16 +442,25 @@ def hard_components(actions: list[Action], ground_truth: GroundTruthPayload) -> 
         * response_rubric["anti_stuffing"],
         4,
     )
+    response_completeness = round(response_completeness * response_rubric["coherence_gate"], 4)
+    if response_rubric["llm_judge_used"]:
+        response_completeness = round(
+            (response_completeness + response_rubric["response_quality"]) / 2,
+            4,
+        )
     return {
         "temporal_reasoning": _priority_score(actions, ground_truth["expected_priority"]),
         "policy_compliance": policy_score,
         "escalation_accuracy": _escalation_score(actions, ground_truth["expected_escalation"]),
+        "contradiction_detection": _contradiction_detection_score(actions, ground_truth),
+        "ordering_correctness": _ordering_correctness_score(actions, ground_truth),
         "history_acknowledgment": response_rubric["history_acknowledgment"],
         "response_completeness": response_completeness,
         "case_specific_facts": response_rubric["case_specific_facts"],
         "next_step_actionability": response_rubric["next_step_actionability"],
         "tone_acknowledgment": response_rubric["tone_acknowledgment"],
         "anti_stuffing": response_rubric["anti_stuffing"],
+        "coherence_gate": response_rubric["coherence_gate"],
         "sequence_penalty_factor": _sequencing_penalty_factor(actions, ground_truth),
         "fraud_handling": _fraud_score(actions, bool(ground_truth["expected_flag_fraud"])),
     }

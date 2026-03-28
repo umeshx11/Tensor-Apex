@@ -50,12 +50,12 @@ def shaped_reward(
     max_steps: int,
     policy_violations: list[str],
     *,
-    snooze_crossed_sla: bool,
+    snooze_sla_violations: int,
     fraud_expected: bool,
 ) -> RewardBreakdown:
     partial_score = grade_actions(actions, ground_truth)
     policy_penalty = POLICY_VIOLATION_PENALTY if policy_violations else 0.0
-    snooze_penalty = SNOOZE_SLA_PENALTY if snooze_crossed_sla else 0.0
+    snooze_penalty = round(SNOOZE_SLA_PENALTY * snooze_sla_violations, 4)
     components = {"valid_action": VALID_ACTION_REWARD}
     if policy_penalty:
         components["policy_penalty"] = policy_penalty

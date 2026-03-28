@@ -117,8 +117,8 @@ From:
 
 Current means (52 scenarios):
 - Easy: `0.8643`
-- Medium: `0.4183`
-- Hard: `0.4154`
+- Medium: `0.4036`
+- Hard: `0.4086`
 
 ## Project Layout
 
@@ -162,6 +162,17 @@ Optional OpenAI baseline support:
 ./.venv/bin/pip install -e ".[dev,openai]"
 ```
 
+Optional Anthropic-backed LLM baseline:
+```bash
+./.venv/bin/pip install -e ".[dev,llm]"
+ANTHROPIC_API_KEY=your-key ./.venv/bin/python baseline.py --agent llm --model claude-3-5-sonnet-latest
+```
+
+Optional hard-task response judge:
+```bash
+JUDGE_API_KEY=your-key BUSINESS_POLICY_ENV_USE_LLM_JUDGE=true ./.venv/bin/python -m pytest tests/ -v
+```
+
 Run API only:
 ```bash
 ./.venv/bin/uvicorn business_policy_env.server:app --host 0.0.0.0 --port 7860
@@ -177,6 +188,7 @@ Run checks:
 ./.venv/bin/ruff check .
 ./.venv/bin/mypy business_policy_env/
 ./.venv/bin/python -m pytest tests/ -v
+./.venv/bin/openenv validate
 ```
 
 ## Docker

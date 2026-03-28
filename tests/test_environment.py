@@ -3,7 +3,7 @@ import unittest
 from fastapi.testclient import TestClient
 
 import baseline as root_baseline
-from business_policy_env.baseline import RuleBasedAgent
+from business_policy_env.baseline import RuleBasedAgent, run_baseline
 from business_policy_env.data_generation import scenario_ids_for_task
 from business_policy_env.environment import BusinessPolicyComplianceEnv
 from business_policy_env.models import Action
@@ -102,6 +102,7 @@ class EnvironmentTests(unittest.TestCase):
 
     def test_substantive_question_rejects_generic_filler(self) -> None:
         self.assertFalse(is_substantive_question("Can you provide more?"))
+        self.assertFalse(is_substantive_question("What is the invoice, charge, date, reason, and account?"))
         self.assertTrue(
             is_substantive_question("Can you confirm the invoice amount and the card used for this charge?")
         )
@@ -312,6 +313,24 @@ class EnvironmentTests(unittest.TestCase):
         self.assertGreater(obs.issue_age_hours, 72)
         self.assertEqual(info["reward_breakdown"]["snooze_sla_penalty"], -0.1)
 
+    def test_snooze_penalty_accumulates_after_sla_crossing(self) -> None:
+        self.env.reset(scenario_id="easy_sla_marginal")
+        self.env.step(
+            Action(
+                action_type="snooze",
+                reasoning="Waiting for customer reply.",
+                snooze_hours=2,
+            )
+        )
+        _, _, _, info = self.env.step(
+            Action(
+                action_type="snooze",
+                reasoning="Still waiting for customer reply.",
+                snooze_hours=1,
+            )
+        )
+        self.assertEqual(info["reward_breakdown"]["snooze_sla_penalty"], -0.2)
+
     def test_flag_fraud_scores_correctly(self) -> None:
         self.env.reset(scenario_id="hard_fraud_chargeback")
         _, reward, _, _ = self.env.step(
@@ -335,6 +354,98 @@ class EnvironmentTests(unittest.TestCase):
 
     def test_root_baseline_entrypoint_exports_main(self) -> None:
         self.assertTrue(callable(root_baseline.main))
+
+    def test_rule_baseline_reports_min_and_max_scores(self) -> None:
+        result = run_baseline(agent_name="rule")
+        self.assertIn("easy", result["results"])
+        self.assertIn("min_final_score", result["results"]["easy"])
+        self.assertIn("max_final_score", result["results"]["easy"])
+
+    def test_hard_conflict_and_ordering_components_reward_better_reasoning(self) -> None:
+        scenario = scenario_registry()["hard_concurrent_violations"]
+        ground_truth = build_ground_truth_payload(scenario, scenario.initial_snapshot)
+        weak_actions = [
+            Action(action_type="flag_fraud", reasoning="Fraud issue.", fraud_reason="Flagging risk."),
+            Action(action_type="categorize", reasoning="Billing issue.", category="billing"),
+            Action(action_type="set_priority", reasoning="Urgent issue.", priority="urgent"),
+            Action(action_type="escalate", reasoning="Policy escalation.", escalation_reason="Needs escalation."),
+            Action(
+                action_type="draft_response",
+                reasoning="Send an update.",
+                response_text="We are reviewing this now.",
+            ),
+        ]
+        strong_actions = [
+            Action(
+                action_type="flag_fraud",
+                reasoning="Fraud risk conflicts with billing and legal pressure.",
+                fraud_reason="Unauthorized duplicate charge requires fraud review.",
+            ),
+            Action(
+                action_type="categorize",
+                reasoning="Billing issue with overlapping fraud and legal signals.",
+                category="billing",
+            ),
+            Action(
+                action_type="set_priority",
+                reasoning="Urgent due to fraud, billing, and legal urgency.",
+                priority="urgent",
+            ),
+            Action(
+                action_type="escalate",
+                reasoning="Escalate after fraud review because legal counsel is involved.",
+                escalation_reason="Legal pressure and high-value billing risk.",
+            ),
+            Action(
+                action_type="draft_response",
+                reasoning="Acknowledge the fraud, billing, and legal conflict clearly.",
+                response_text=(
+                    "We understand the unauthorized billing charge and the legal urgency. "
+                    "Our fraud and billing teams are reviewing the issue now, and we will send a concrete update today."
+                ),
+            ),
+        ]
+        weak_components = component_scores(weak_actions, ground_truth)
+        strong_components = component_scores(strong_actions, ground_truth)
+        self.assertGreater(strong_components["contradiction_detection"], weak_components["contradiction_detection"])
+        self.assertGreater(grade_actions(strong_actions, ground_truth), grade_actions(weak_actions, ground_truth))
+
+    def test_hard_ordering_component_penalizes_wrong_sequence(self) -> None:
+        scenario = scenario_registry()["hard_three_signal_precedence"]
+        ground_truth = build_ground_truth_payload(scenario, scenario.initial_snapshot)
+        ordered_actions = [
+            Action(action_type="flag_fraud", reasoning="Fraud first.", fraud_reason="Unauthorized activity."),
+            Action(action_type="categorize", reasoning="Billing issue.", category="billing"),
+            Action(action_type="set_priority", reasoning="Urgent issue.", priority="urgent"),
+            Action(action_type="escalate", reasoning="Legal escalation.", escalation_reason="Legal and policy risk."),
+            Action(
+                action_type="draft_response",
+                reasoning="Respond after the required actions.",
+                response_text="We have flagged the fraud issue, escalated the case, and will update you today.",
+            ),
+        ]
+        wrong_order_actions = [
+            Action(
+                action_type="escalate",
+                reasoning="Escalate immediately.",
+                escalation_reason="Legal and policy risk.",
+            ),
+            Action(
+                action_type="flag_fraud",
+                reasoning="Fraud second, which is wrong.",
+                fraud_reason="Unauthorized activity.",
+            ),
+            Action(action_type="categorize", reasoning="Billing issue.", category="billing"),
+            Action(action_type="set_priority", reasoning="Urgent issue.", priority="urgent"),
+            Action(
+                action_type="draft_response",
+                reasoning="Respond after the required actions.",
+                response_text="We have escalated the case and flagged the fraud issue for review today.",
+            ),
+        ]
+        ordered_components = component_scores(ordered_actions, ground_truth)
+        wrong_components = component_scores(wrong_order_actions, ground_truth)
+        self.assertGreater(ordered_components["ordering_correctness"], wrong_components["ordering_correctness"])
 
     def test_done_branch_reports_episode_complete_for_valid_follow_on_actions(self) -> None:
         self.env.reset(scenario_id="easy_vip_refund")

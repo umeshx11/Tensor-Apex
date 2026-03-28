@@ -70,6 +70,8 @@ class GroundTruth(BaseModel):
     clarification_keywords: list[str] = Field(default_factory=list)
     response_keywords: list[str] = Field(default_factory=list)
     history_keywords: list[str] = Field(default_factory=list)
+    conflict_keywords: list[str] = Field(default_factory=list)
+    required_action_order: list[ActionType] = Field(default_factory=list)
     completion_action_types: list[ActionType] = Field(default_factory=list)
     ambiguous: bool = False
 
