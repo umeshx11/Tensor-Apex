@@ -14,13 +14,17 @@ EFFICIENCY_BONUS = 0.1
 INVALID_ACTION_REWARD = -0.1
 
 
-def _clamp_reward(value: float) -> float:
+def _clamp_terminal_reward(value: float) -> float:
     return max(0.0, min(1.0, round(value, 4)))
+
+
+def _clamp_step_reward(value: float) -> float:
+    return max(-1.0, min(1.0, round(value, 4)))
 
 
 def invalid_action_breakdown(message: str) -> RewardBreakdown:
     return RewardBreakdown(
-        reward=_clamp_reward(INVALID_ACTION_REWARD),
+        reward=_clamp_step_reward(INVALID_ACTION_REWARD),
         components={"invalid_action": INVALID_ACTION_REWARD},
         explanation=message,
     )
@@ -52,17 +56,17 @@ def shaped_reward(
     partial_score = grade_actions(actions, ground_truth)
     policy_penalty = POLICY_VIOLATION_PENALTY if policy_violations else 0.0
     snooze_penalty = SNOOZE_SLA_PENALTY if snooze_crossed_sla else 0.0
-    components = {
-        "valid_action": VALID_ACTION_REWARD,
-        "policy_penalty": policy_penalty,
-        "snooze_sla_penalty": snooze_penalty,
-    }
+    components = {"valid_action": VALID_ACTION_REWARD}
+    if policy_penalty:
+        components["policy_penalty"] = policy_penalty
+    if snooze_penalty:
+        components["snooze_sla_penalty"] = snooze_penalty
 
     if done:
         efficiency_bonus = EFFICIENCY_BONUS if len(actions) <= max_steps / 2 else 0.0
         redundancy_penalty = _redundancy_penalty([action.action_type for action in actions])
         fraud_penalty = _fraud_missed_penalty(actions, fraud_expected)
-        final_reward = _clamp_reward(
+        final_reward = _clamp_terminal_reward(
             partial_score
             + VALID_ACTION_REWARD
             + efficiency_bonus
@@ -71,18 +75,17 @@ def shaped_reward(
             + snooze_penalty
             + fraud_penalty
         )
-        components.update(
-            {
-                "final_score": partial_score,
-                "efficiency_bonus": efficiency_bonus,
-                "redundancy_penalty": -redundancy_penalty,
-                "fraud_missed_penalty": fraud_penalty,
-            }
-        )
+        components["final_score"] = partial_score
+        if efficiency_bonus:
+            components["efficiency_bonus"] = efficiency_bonus
+        if redundancy_penalty:
+            components["redundancy_penalty"] = -redundancy_penalty
+        if fraud_penalty:
+            components["fraud_missed_penalty"] = fraud_penalty
         explanation = "Final reward includes grader score, bonuses, and policy/fraud/snooze penalties."
         return RewardBreakdown(reward=final_reward, components=components, explanation=explanation)
 
-    intermediate_reward = _clamp_reward(VALID_ACTION_REWARD + partial_score + policy_penalty + snooze_penalty)
+    intermediate_reward = _clamp_step_reward(VALID_ACTION_REWARD + partial_score + policy_penalty + snooze_penalty)
     components["partial_score"] = partial_score
     explanation = "Intermediate reward includes valid-action bonus, partial score, and immediate penalties."
     return RewardBreakdown(reward=intermediate_reward, components=components, explanation=explanation)

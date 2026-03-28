@@ -2,24 +2,19 @@ from __future__ import annotations
 
 import threading
 from typing import Any
+from uuid import uuid4
 
 import gradio as gr
 import uvicorn
 
-from business_policy_env.environment import BusinessPolicyComplianceEnv
-from business_policy_env.models import Action
+from business_policy_env.models import Action, Observation
 from business_policy_env.server import app as fastapi_app
+from business_policy_env.session_manager import RateLimitError, SessionCapacityError, get_session_manager
 from business_policy_env.tasks import scenario_registry
 
 
 def start_api() -> None:
     uvicorn.run(fastapi_app, host="0.0.0.0", port=7860, log_level="error")
-
-
-threading.Thread(target=start_api, daemon=True).start()
-
-env = BusinessPolicyComplianceEnv()
-current_obs = None
 
 
 def get_scenario_choices() -> list[tuple[str, str]]:
@@ -28,12 +23,13 @@ def get_scenario_choices() -> list[tuple[str, str]]:
     return [(f"[{scenario.difficulty.upper()}] {scenario.title}", scenario.scenario_id) for scenario in entries]
 
 
-def format_observation(obs) -> str:
+def format_observation(obs: Observation) -> str:
     lines = [
         f"**Scenario:** {obs.scenario_id} [{obs.difficulty}]",
         f"**Policy version:** {obs.policy_version}",
         f"**Phase:** {obs.episode_phase}",
         f"**Steps:** {obs.steps_taken}/{obs.max_steps}",
+        f"**Hidden emails remaining:** {obs.emails_remaining}",
         f"**Issue age:** {obs.issue_age_hours:.1f}h",
         f"**Sender tier:** {obs.sender_tier}",
         f"**Refund amount:** {'$' + str(obs.refund_amount) if obs.refund_amount is not None else 'N/A'}",
@@ -55,18 +51,36 @@ def format_observation(obs) -> str:
     return "\n".join(lines)
 
 
-def reset_episode(scenario_id: str) -> tuple[str, str, str, dict[str, Any]]:
-    global current_obs
-    current_obs = env.reset(scenario_id=scenario_id)
+def _ensure_session_id(session_id: str | None) -> str:
+    return session_id or f"gradio-{uuid4().hex}"
+
+
+def _rate_limit(session_id: str) -> None:
+    get_session_manager().enforce_rate_limit("gradio-ui", session_id)
+
+
+def reset_episode(scenario_id: str, session_id: str | None) -> tuple[str, str, str, dict[str, Any], str]:
+    active_session_id = _ensure_session_id(session_id)
+    try:
+        _rate_limit(active_session_id)
+        env = get_session_manager().get_or_create(active_session_id)
+        observation = env.reset(scenario_id=scenario_id)
+    except RateLimitError as exc:
+        return "", "", str(exc), gr.update(interactive=False), active_session_id
+    except SessionCapacityError as exc:
+        return "", "", str(exc), gr.update(interactive=False), active_session_id
+
     return (
-        format_observation(current_obs),
+        format_observation(observation),
         "",
         "Episode reset. Ready for actions.",
         gr.update(interactive=True),
+        active_session_id,
     )
 
 
 def take_action(
+    session_id: str | None,
     action_type: str,
     category: str,
     priority: str,
@@ -76,10 +90,19 @@ def take_action(
     fraud_reason: str,
     snooze_hours: int,
     reasoning: str,
-) -> tuple[str, str, str]:
-    global current_obs
-    if current_obs is None:
-        return "Reset the environment first.", "", "No active episode."
+) -> tuple[str, str, str, str]:
+    if not session_id:
+        return "Reset the environment first.", "", "No active episode.", ""
+
+    try:
+        _rate_limit(session_id)
+        env = get_session_manager().get(session_id)
+    except RateLimitError as exc:
+        return "", "", str(exc), session_id
+
+    if env is None:
+        return "Reset the environment first.", "", "Session expired. Reset the episode again.", session_id
+
     try:
         action = Action(
             action_type=action_type,
@@ -93,82 +116,109 @@ def take_action(
             snooze_hours=snooze_hours or None,
         )
     except Exception as exc:  # pragma: no cover - UI validation path
-        return format_observation(current_obs), "", f"Invalid action: {exc}"
+        observation = env.state().get("observation")
+        rendered = format_observation(Observation.model_validate(observation)) if observation else ""
+        return rendered, "", f"Invalid action: {exc}", session_id
 
-    current_obs, reward, done, info = env.step(action)
+    observation, reward, done, info = env.step(action)
     status = f"Reward: {reward:.4f} | Done: {done}"
     if info.get("policy_violations"):
         status += f" | Policy violations: {', '.join(info['policy_violations'])}"
     if done:
         status += f" | Final score: {info.get('final_score', 0):.4f}"
-    return format_observation(current_obs), str(info.get("component_scores", {})), status
+    return format_observation(observation), str(info.get("component_scores", {})), status, session_id
 
 
-with gr.Blocks(title="Business Policy Compliance Environment") as demo:
-    gr.Markdown("## Business Policy Compliance & Customer Resolution Environment")
-    gr.Markdown("_Policy-aware agent evaluation. Select a scenario, reset, then step through actions._")
+def close_episode(session_id: str | None) -> tuple[str, str, str, dict[str, Any], str]:
+    if session_id:
+        get_session_manager().close(session_id)
+    return "", "", "Session closed.", gr.update(interactive=False), ""
 
-    with gr.Row():
-        scenario_dd = gr.Dropdown(choices=get_scenario_choices(), label="Scenario", value=None)
-        reset_btn = gr.Button("Reset episode", variant="primary")
 
-    obs_display = gr.Markdown(label="Observation")
+def create_demo() -> gr.Blocks:
+    with gr.Blocks(title="Business Policy Compliance Environment") as demo:
+        session_state = gr.State("")
 
-    with gr.Row():
-        action_type = gr.Dropdown(
-            choices=[
-                "categorize",
-                "set_priority",
-                "draft_response",
-                "escalate",
-                "mark_spam",
-                "request_info",
-                "flag_fraud",
-                "snooze",
+        gr.Markdown("## Business Policy Compliance & Customer Resolution Environment")
+        gr.Markdown("_Policy-aware agent evaluation. Select a scenario, reset, then step through actions._")
+
+        with gr.Row():
+            scenario_dd = gr.Dropdown(choices=get_scenario_choices(), label="Scenario", value=None)
+            reset_btn = gr.Button("Reset episode", variant="primary")
+            close_btn = gr.Button("Close session", variant="secondary")
+
+        obs_display = gr.Markdown(label="Observation")
+
+        with gr.Row():
+            action_type = gr.Dropdown(
+                choices=[
+                    "categorize",
+                    "set_priority",
+                    "draft_response",
+                    "escalate",
+                    "mark_spam",
+                    "request_info",
+                    "flag_fraud",
+                    "snooze",
+                ],
+                label="Action type",
+            )
+            reasoning = gr.Textbox(label="Reasoning (not graded)", placeholder="Why are you taking this action?")
+
+        with gr.Row():
+            category = gr.Dropdown(
+                choices=["billing", "technical_support", "returns", "legal", "customer_success", "spam"],
+                label="Category",
+            )
+            priority = gr.Dropdown(choices=["low", "medium", "high", "urgent"], label="Priority")
+
+        with gr.Row():
+            response_text = gr.Textbox(label="Response text (for draft_response)")
+            escalation_reason = gr.Textbox(label="Escalation reason (for escalate)")
+            clarifying_question = gr.Textbox(label="Clarifying question (for request_info)")
+
+        with gr.Row():
+            fraud_reason = gr.Textbox(label="Fraud reason (for flag_fraud)")
+            snooze_hours = gr.Number(label="Snooze hours (for snooze)", precision=0, value=0)
+
+        step_btn = gr.Button("Take action", variant="secondary", interactive=False)
+        scores_display = gr.Textbox(label="Component scores", interactive=False)
+        status_display = gr.Textbox(label="Status / reward", interactive=False)
+
+        reset_btn.click(
+            reset_episode,
+            inputs=[scenario_dd, session_state],
+            outputs=[obs_display, scores_display, status_display, step_btn, session_state],
+        )
+        step_btn.click(
+            take_action,
+            inputs=[
+                session_state,
+                action_type,
+                category,
+                priority,
+                response_text,
+                escalation_reason,
+                clarifying_question,
+                fraud_reason,
+                snooze_hours,
+                reasoning,
             ],
-            label="Action type",
+            outputs=[obs_display, scores_display, status_display, session_state],
         )
-        reasoning = gr.Textbox(label="Reasoning (not graded)", placeholder="Why are you taking this action?")
-
-    with gr.Row():
-        category = gr.Dropdown(
-            choices=["billing", "technical_support", "returns", "legal", "customer_success", "spam"],
-            label="Category",
+        close_btn.click(
+            close_episode,
+            inputs=[session_state],
+            outputs=[obs_display, scores_display, status_display, step_btn, session_state],
         )
-        priority = gr.Dropdown(choices=["low", "medium", "high", "urgent"], label="Priority")
 
-    with gr.Row():
-        response_text = gr.Textbox(label="Response text (for draft_response)")
-        escalation_reason = gr.Textbox(label="Escalation reason (for escalate)")
-        clarifying_question = gr.Textbox(label="Clarifying question (for request_info)")
+    return demo
 
-    with gr.Row():
-        fraud_reason = gr.Textbox(label="Fraud reason (for flag_fraud)")
-        snooze_hours = gr.Number(label="Snooze hours (for snooze)", precision=0, value=0)
 
-    step_btn = gr.Button("Take action", variant="secondary")
-    scores_display = gr.Textbox(label="Component scores", interactive=False)
-    status_display = gr.Textbox(label="Status / reward", interactive=False)
+def main() -> None:
+    threading.Thread(target=start_api, daemon=True).start()
+    create_demo().launch(server_port=7861, share=False)
 
-    reset_btn.click(
-        reset_episode,
-        inputs=[scenario_dd],
-        outputs=[obs_display, scores_display, status_display, step_btn],
-    )
-    step_btn.click(
-        take_action,
-        inputs=[
-            action_type,
-            category,
-            priority,
-            response_text,
-            escalation_reason,
-            clarifying_question,
-            fraud_reason,
-            snooze_hours,
-            reasoning,
-        ],
-        outputs=[obs_display, scores_display, status_display],
-    )
 
-demo.launch(server_port=7861, share=False)
+if __name__ == "__main__":
+    main()

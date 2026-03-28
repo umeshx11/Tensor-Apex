@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import random
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Literal
@@ -807,33 +809,84 @@ HARD_TEMPLATES: list[ScenarioTemplate] = [
 ]
 
 
+ALL_TEMPLATES: tuple[ScenarioTemplate, ...] = tuple(EASY_TEMPLATES + MEDIUM_TEMPLATES + HARD_TEMPLATES)
+TEMPLATE_REGISTRY: dict[str, ScenarioTemplate] = {template.scenario_id: template for template in ALL_TEMPLATES}
+
+
+def scenario_ids_for_task(task_name: Difficulty | None = None) -> list[str]:
+    templates = ALL_TEMPLATES if task_name is None else tuple(
+        template for template in ALL_TEMPLATES if template.difficulty == task_name
+    )
+    return [template.scenario_id for template in templates]
+
+
 class ScenarioFactory:
     def __init__(self, seed: int = 20260328):
-        self._fake = Faker()
-        self._fake.seed_instance(seed)
+        self._seed = seed
         self._base_now = datetime(2026, 3, 28, 10, 0, 0)
 
     def build_all(self) -> list[TaskScenario]:
-        scenarios: list[TaskScenario] = []
-        for template in EASY_TEMPLATES + MEDIUM_TEMPLATES + HARD_TEMPLATES:
-            scenarios.append(self._build(template))
-        return scenarios
+        return [self.build_canonical_scenario(template.scenario_id) for template in ALL_TEMPLATES]
 
-    def _build(self, t: ScenarioTemplate) -> TaskScenario:
-        sender_name = self._fake.name()
-        sender_email = self._fake.email()
-        first_message_time = self._base_now - timedelta(hours=t.age_hours)
+    def build_canonical_scenario(self, scenario_id: str) -> TaskScenario:
+        return self._build(TEMPLATE_REGISTRY[scenario_id], variant_key=None)
+
+    def build_variant_scenario(self, scenario_id: str, variant_key: str | int) -> TaskScenario:
+        return self._build(TEMPLATE_REGISTRY[scenario_id], variant_key=str(variant_key))
+
+    def _build(self, t: ScenarioTemplate, *, variant_key: str | None) -> TaskScenario:
+        rng = self._rng_for_key(t.scenario_id if variant_key is None else f"{t.scenario_id}:{variant_key}")
+        fake = Faker()
+        fake.seed_instance(
+            self._stable_seed(
+                t.scenario_id if variant_key is None else f"{t.scenario_id}:{variant_key}:faker"
+            )
+        )
+
+        refund_amount = t.refund_amount if variant_key is None else self._variant_refund_amount(t, rng)
+        age_hours = t.age_hours if variant_key is None else self._variant_age_hours(t, rng)
+        subject = t.subject if variant_key is None else self._paraphrase_text(t.subject, rng)
+        thread_bodies = (
+            list(t.thread_bodies)
+            if variant_key is None
+            else self._variant_thread_bodies(t, rng, refund_amount)
+        )
+        clarification_body = (
+            t.clarification_body
+            if variant_key is None or t.clarification_body is None
+            else self._variant_text(t.clarification_body, t, rng, refund_amount)
+        )
+
+        sender_name = fake.name()
+        sender_email = fake.email()
+        first_message_time = self._base_now - timedelta(hours=age_hours)
         directions = self._message_directions(t)
-        thread = self._build_thread(t, sender_name, sender_email, first_message_time, directions)
+        thread = self._build_thread(
+            t,
+            subject,
+            thread_bodies,
+            sender_name,
+            sender_email,
+            first_message_time,
+            directions,
+            age_hours=age_hours,
+            rng=None if variant_key is None else rng,
+        )
 
         account_flags = list(t.account_flags)
         if t.suspended_account and "suspended" not in account_flags:
             account_flags.append("suspended")
 
-        initial_refund_amount = None if t.requires_request_info else t.refund_amount
-        deterministic_id = abs(sum(ord(char) for char in t.scenario_id)) % 1000
-        order_seed = abs(sum(ord(char) for char in t.scenario_id + "_order")) % 10000
+        initial_refund_amount = None if t.requires_request_info else refund_amount
+        scenario_token = t.scenario_id if variant_key is None else f"{t.scenario_id}:{variant_key}"
+        deterministic_id = self._stable_seed(scenario_token) % 1000
+        order_seed = self._stable_seed(f"{scenario_token}:order") % 10000
         ticket_id = f"T-{t.difficulty.upper()}-{deterministic_id:03d}"
+        scenario_id = (
+            t.scenario_id
+            if variant_key is None
+            else f"{t.scenario_id}__variant_{self._stable_seed(scenario_token) % 100000:05d}"
+        )
 
         initial_snapshot = TicketSnapshot(
             ticket_id=ticket_id,
@@ -846,7 +899,7 @@ class ScenarioFactory:
         )
 
         clarification_snapshot = None
-        if t.clarification_body:
+        if clarification_body:
             clarification_time = thread[-1].timestamp + timedelta(hours=2)
             clarification_snapshot = TicketSnapshot(
                 ticket_id=ticket_id,
@@ -855,8 +908,8 @@ class ScenarioFactory:
                     self._message(
                         message_id=f"{t.scenario_id}_clarification",
                         timestamp=clarification_time,
-                        subject=f"Re: {t.subject}",
-                        body=t.clarification_body,
+                        subject=f"Re: {subject}",
+                        body=clarification_body,
                         sender_name=sender_name,
                         sender_email=sender_email,
                         direction="customer",
@@ -864,7 +917,7 @@ class ScenarioFactory:
                 ],
                 sender_tier=t.sender_tier,
                 account_flags=account_flags,
-                refund_amount=t.refund_amount,
+                refund_amount=refund_amount,
                 order_id=f"ORD-{order_seed:04d}",
                 visible_problem_type=t.expected_category,
             )
@@ -890,7 +943,7 @@ class ScenarioFactory:
         }[t.difficulty]
 
         return TaskScenario(
-            scenario_id=t.scenario_id,
+            scenario_id=scenario_id,
             difficulty=t.difficulty,
             title=t.title,
             objective=t.objective or default_objective,
@@ -916,6 +969,92 @@ class ScenarioFactory:
             ),
         )
 
+    def _stable_seed(self, key: str) -> int:
+        return sum((index + 1) * ord(char) for index, char in enumerate(f"{self._seed}:{key}"))
+
+    def _rng_for_key(self, key: str) -> random.Random:
+        return random.Random(self._stable_seed(key))
+
+    def _variant_refund_amount(self, template: ScenarioTemplate, rng: random.Random) -> float | None:
+        if template.refund_amount is None:
+            return None
+        amount = float(template.refund_amount)
+        if amount > 500:
+            varied = amount * rng.uniform(0.9, 1.12)
+            return round(max(525.0, varied), 2)
+        if amount >= 100:
+            varied = amount * rng.uniform(0.88, 1.12)
+            return round(min(495.0, max(50.0, varied)), 2)
+        varied = amount * rng.uniform(0.82, 1.18)
+        return round(min(495.0, max(15.0, varied)), 2)
+
+    def _variant_age_hours(self, template: ScenarioTemplate, rng: random.Random) -> float:
+        age = float(template.age_hours)
+        if age < 24:
+            return round(min(23.5, max(1.0, age + rng.uniform(-4.0, 4.0))), 2)
+        if age < 72:
+            return round(min(71.5, max(24.5, age + rng.uniform(-6.0, 6.0))), 2)
+        return round(max(72.5, age + rng.uniform(-12.0, 12.0)), 2)
+
+    def _variant_thread_bodies(
+        self,
+        template: ScenarioTemplate,
+        rng: random.Random,
+        refund_amount: float | None,
+    ) -> list[str]:
+        return [self._variant_text(body, template, rng, refund_amount) for body in template.thread_bodies]
+
+    def _variant_text(
+        self,
+        text: str,
+        template: ScenarioTemplate,
+        rng: random.Random,
+        refund_amount: float | None,
+    ) -> str:
+        updated = self._paraphrase_text(text, rng)
+        if template.refund_amount is not None and refund_amount is not None:
+            updated = self._replace_amount_mentions(updated, template.refund_amount, refund_amount)
+        return updated
+
+    def _replace_amount_mentions(self, text: str, original_amount: float, new_amount: float) -> str:
+        rounded_original = int(round(original_amount))
+        rounded_new = int(round(new_amount))
+        replacements = {
+            f"${rounded_original}": f"${rounded_new}",
+            str(rounded_original): str(rounded_new),
+            f"${original_amount:.2f}": f"${new_amount:.2f}",
+        }
+        updated = text
+        for source, target in replacements.items():
+            updated = updated.replace(source, target)
+        return updated
+
+    def _paraphrase_text(self, text: str, rng: random.Random) -> str:
+        replacements = {
+            "need help": ["need help", "need assistance", "need support"],
+            "help": ["help", "assistance", "support"],
+            "urgent": ["urgent", "time-sensitive", "pressing"],
+            "refund": ["refund", "reimbursement"],
+            "duplicate": ["duplicate", "extra", "double"],
+            "charge": ["charge", "billing item", "billing entry"],
+            "issue": ["issue", "problem", "situation"],
+            "reviewing": ["reviewing", "looking into", "checking"],
+            "update": ["update", "follow-up", "status update"],
+            "still": ["still", "currently", "at the moment"],
+            "account": ["account", "workspace account", "profile"],
+            "today": ["today", "this business day", "as soon as possible"],
+            "app": ["app", "application"],
+        }
+
+        updated = text
+        for source, options in replacements.items():
+            pattern = re.compile(re.escape(source), re.IGNORECASE)
+            if not pattern.search(updated):
+                continue
+            replacement = rng.choice(options)
+            updated = pattern.sub(lambda _: replacement, updated, count=1)
+        return updated
+
     def _message_directions(self, t: ScenarioTemplate) -> list[Literal["customer", "agent", "system"]]:
         if not t.thread_directions:
             return ["customer"] * len(t.thread_bodies)
@@ -926,21 +1065,28 @@ class ScenarioFactory:
     def _build_thread(
         self,
         t: ScenarioTemplate,
+        subject: str,
+        thread_bodies: list[str],
         sender_name: str,
         sender_email: str,
         first_message_time: datetime,
         directions: list[Literal["customer", "agent", "system"]],
+        *,
+        age_hours: float,
+        rng: random.Random | None,
     ) -> list[EmailMessage]:
-        if len(t.thread_bodies) == 1:
+        if len(thread_bodies) == 1:
             timestamps = [first_message_time]
         else:
-            spacing = max(1.0, t.age_hours / len(t.thread_bodies))
+            spacing = max(1.0, age_hours / len(thread_bodies))
+            if rng is not None:
+                spacing = max(1.0, spacing * rng.uniform(0.92, 1.08))
             timestamps = [
-                first_message_time + timedelta(hours=index * spacing) for index in range(len(t.thread_bodies))
+                first_message_time + timedelta(hours=index * spacing) for index in range(len(thread_bodies))
             ]
 
         thread: list[EmailMessage] = []
-        for index, body in enumerate(t.thread_bodies, start=1):
+        for index, body in enumerate(thread_bodies, start=1):
             message_body = body
             if t.legal_language and index == len(t.thread_bodies):
                 lowered = message_body.lower()
@@ -950,7 +1096,7 @@ class ScenarioFactory:
                 self._message(
                     message_id=f"{t.scenario_id}_m{index}",
                     timestamp=timestamps[index - 1],
-                    subject=t.subject,
+                    subject=subject,
                     body=message_body,
                     sender_name=sender_name,
                     sender_email=sender_email,

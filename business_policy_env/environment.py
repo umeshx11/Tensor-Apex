@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import sqlite3
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -8,16 +9,28 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from .data_generation import ScenarioFactory, scenario_ids_for_task
 from .models import Action, ActionRecord, EpisodePhase, Observation, TaskScenario, TicketSnapshot
 from .policies import check_policy_violations, policy_rules_for
 from .rewards import current_progress, invalid_action_breakdown, shaped_reward
-from .tasks import build_ground_truth_payload, compute_issue_age_hours, scenario_registry, scenarios_for_task
+from .tasks import (
+    build_ground_truth_payload,
+    compute_issue_age_hours,
+    is_substantive_question,
+    request_info_quality,
+)
 
 
 class BusinessPolicyComplianceEnv:
-    def __init__(self) -> None:
-        self._scenario_registry = scenario_registry()
-        self._task_cursors: dict[str, int] = defaultdict(int)
+    def __init__(self, seed: int = 20260328) -> None:
+        self._seed = seed
+        self._scenario_factory = ScenarioFactory(seed=seed)
+        self._task_family_ids = {task: scenario_ids_for_task(task) for task in ("easy", "medium", "hard")}
+        self._shuffle_bags: dict[str, list[str]] = defaultdict(list)
+        self._selection_rngs = {
+            task: random.Random(self._stable_seed(f"shuffle:{task}")) for task in self._task_family_ids
+        }
+        self._variant_counters: dict[str, int] = defaultdict(int)
         self._connection = self._create_connection()
         self.current_scenario: TaskScenario | None = None
         self.action_history: list[ActionRecord] = []
@@ -26,6 +39,9 @@ class BusinessPolicyComplianceEnv:
         self._simulated_offset_hours = 0.0
         self._snooze_crossed_sla = False
         self.done = False
+
+    def _stable_seed(self, key: str) -> int:
+        return sum((index + 1) * ord(char) for index, char in enumerate(f"{self._seed}:{key}"))
 
     def _create_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(":memory:", check_same_thread=False)
@@ -44,26 +60,36 @@ class BusinessPolicyComplianceEnv:
         connection.commit()
         return connection
 
+    def close(self) -> None:
+        try:
+            self._connection.close()
+        except sqlite3.Error:
+            return
+
     def _reset_connection(self) -> None:
-        self._connection.close()
+        self.close()
         self._connection = self._create_connection()
 
     def available_tasks(self) -> dict[str, list[str]]:
-        return {
-            "easy": [scenario.scenario_id for scenario in scenarios_for_task("easy")],
-            "medium": [scenario.scenario_id for scenario in scenarios_for_task("medium")],
-            "hard": [scenario.scenario_id for scenario in scenarios_for_task("hard")],
-        }
+        return {task: list(ids) for task, ids in self._task_family_ids.items()}
+
+    def _next_family_id(self, task_name: str) -> str:
+        bag = self._shuffle_bags[task_name]
+        if not bag:
+            bag = list(self._task_family_ids[task_name])
+            self._selection_rngs[task_name].shuffle(bag)
+            self._shuffle_bags[task_name] = bag
+        return self._shuffle_bags[task_name].pop()
 
     def _select_scenario(self, task_name: str | None, scenario_id: str | None) -> TaskScenario:
         if scenario_id:
-            return self._scenario_registry[scenario_id]
+            return self._scenario_factory.build_canonical_scenario(scenario_id)
 
         selected_task = task_name or "easy"
-        candidates = scenarios_for_task(selected_task)
-        cursor = self._task_cursors[selected_task] % len(candidates)
-        self._task_cursors[selected_task] += 1
-        return candidates[cursor]
+        family_id = self._next_family_id(selected_task)
+        variant_index = self._variant_counters[selected_task]
+        self._variant_counters[selected_task] += 1
+        return self._scenario_factory.build_variant_scenario(family_id, variant_key=f"{selected_task}:{variant_index}")
 
     def _active_snapshot(self) -> TaskScenario:
         if self.current_scenario is None:
@@ -86,6 +112,12 @@ class BusinessPolicyComplianceEnv:
 
     def _issue_age_hours(self) -> float:
         return round(self._base_issue_age_hours() + self._simulated_offset_hours, 2)
+
+    def _emails_remaining(self) -> int:
+        scenario = self._active_snapshot()
+        if self.clarification_received or scenario.clarification_snapshot is None:
+            return 0
+        return max(0, len(scenario.clarification_snapshot.thread) - len(scenario.initial_snapshot.thread))
 
     def _step_timestamp(self, step_index: int) -> datetime:
         scenario = self._active_snapshot()
@@ -122,7 +154,7 @@ class BusinessPolicyComplianceEnv:
             account_flags=snapshot.account_flags,
             refund_amount=snapshot.refund_amount,
             issue_age_hours=self._issue_age_hours(),
-            emails_remaining=1,
+            emails_remaining=self._emails_remaining(),
             steps_taken=len(self.action_history),
             max_steps=scenario.max_steps,
             action_history=self.action_history,
@@ -145,7 +177,9 @@ class BusinessPolicyComplianceEnv:
 
         if phase == EpisodePhase.initial:
             if action.action_type == "request_info":
-                self.episode_phase = EpisodePhase.awaiting_clarification
+                self.episode_phase = (
+                    EpisodePhase.post_clarification if self.clarification_received else EpisodePhase.awaiting_clarification
+                )
             elif action.action_type in resolving_actions:
                 self.episode_phase = EpisodePhase.resolving
         elif phase == EpisodePhase.awaiting_clarification:
@@ -155,11 +189,16 @@ class BusinessPolicyComplianceEnv:
             if action.action_type in resolving_actions:
                 self.episode_phase = EpisodePhase.resolving
 
-        if self.episode_phase == EpisodePhase.awaiting_clarification and self.clarification_received:
-            self.episode_phase = EpisodePhase.post_clarification
-
         if self._completion_reached() or self.done:
             self.episode_phase = EpisodePhase.complete
+
+    def _should_unlock_clarification(self, action: Action, scenario: TaskScenario) -> bool:
+        if action.action_type != "request_info" or scenario.clarification_snapshot is None or self.clarification_received:
+            return False
+        if not is_substantive_question(action.clarifying_question):
+            return False
+        ground_truth = build_ground_truth_payload(scenario, scenario.clarification_snapshot)
+        return request_info_quality(action, ground_truth) >= 0.5
 
     def reset(self, task_name: str | None = None, scenario_id: str | None = None) -> Observation:
         self.current_scenario = self._select_scenario(task_name, scenario_id)
@@ -232,11 +271,7 @@ class BusinessPolicyComplianceEnv:
         self.action_history.append(record)
         self._log_action(record)
 
-        if (
-            action.action_type == "request_info"
-            and scenario.clarification_snapshot is not None
-            and not self.clarification_received
-        ):
+        if self._should_unlock_clarification(action, scenario):
             self.clarification_received = True
 
         if len(self.action_history) >= scenario.max_steps or self._completion_reached():
@@ -270,24 +305,16 @@ class BusinessPolicyComplianceEnv:
 
     def state(self) -> dict[str, Any]:
         if self.current_scenario is None:
-            return {
-                "active": False,
-                "ground_truth": None,
-                "dataset_reference": None,
-                "episode_log": [],
-                "current_task_configuration": None,
-                "policy_rules": [],
-                "internal_variables": {},
-            }
+            return {"active": False, "detail": "Environment has not been reset."}
 
         scenario = self._active_snapshot()
-        active_snapshot = self._grade_snapshot()
+        observation = self._observation()
         return {
             "active": True,
-            "ground_truth": build_ground_truth_payload(scenario, active_snapshot),
-            "dataset_reference": scenario.model_dump(mode="json"),
+            "observation": observation.model_dump(mode="json"),
             "episode_log": self._episode_log(),
             "current_task_configuration": {
+                "scenario_id": observation.scenario_id,
                 "difficulty": scenario.difficulty,
                 "max_steps": scenario.max_steps,
                 "objective": scenario.objective,
@@ -304,3 +331,22 @@ class BusinessPolicyComplianceEnv:
                 "steps_taken": len(self.action_history),
             },
         }
+
+    def debug_state(self) -> dict[str, Any]:
+        if self.current_scenario is None:
+            return {
+                "active": False,
+                "ground_truth": None,
+                "dataset_reference": None,
+                "episode_log": [],
+                "current_task_configuration": None,
+                "policy_rules": [],
+                "internal_variables": {},
+            }
+
+        scenario = self._active_snapshot()
+        active_snapshot = self._grade_snapshot()
+        state = self.state()
+        state["ground_truth"] = build_ground_truth_payload(scenario, active_snapshot)
+        state["dataset_reference"] = scenario.model_dump(mode="json")
+        return state

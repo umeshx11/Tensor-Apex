@@ -14,4 +14,24 @@ jobs:
       - run: ruff check .
       - run: mypy business_policy_env/
       - run: python -m pytest tests/ -v
-      - run: python baseline.py --agent rule
+      - run: |
+          python baseline.py --agent rule > baseline-results.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(Path("baseline-results.json").read_text())
+          assert data["agent"] == "rule"
+          assert set(data["results"]) == {"easy", "medium", "hard"}
+          PY
+      - run: docker build -t business-policy-env-ci .
+      - run: |
+          docker run -d --name business-policy-env-smoke -p 7860:7860 -p 7861:7861 business-policy-env-ci
+          trap 'docker rm -f business-policy-env-smoke' EXIT
+          timeout 60 bash -c 'until curl -fsS http://127.0.0.1:7860/health; do sleep 1; done'
+      - run: |
+          if command -v openenv >/dev/null 2>&1; then
+            openenv validate
+          else
+            echo "openenv not installed; skipping validation"
+          fi

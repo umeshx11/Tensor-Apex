@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from functools import lru_cache
+import re
 from typing import Any
 
 from .data_generation import build_scenarios
@@ -16,7 +16,6 @@ def compute_issue_age_hours(snapshot: TicketSnapshot, now: datetime) -> float:
     return round((now - first_timestamp).total_seconds() / 3600, 2)
 
 
-@lru_cache(maxsize=1)
 def scenario_registry() -> dict[str, TaskScenario]:
     return {scenario.scenario_id: scenario for scenario in build_scenarios()}
 
@@ -60,7 +59,13 @@ def latest_action(actions: list[Action], action_type: str) -> Action | None:
     return None
 
 
-def _request_info_quality(action: Action | None, keywords: list[str]) -> float:
+def _tokenize(text: str | None) -> list[str]:
+    if not text:
+        return []
+    return re.findall(r"[a-z0-9']+", text.lower())
+
+
+def _request_info_keyword_score(action: Action | None, keywords: list[str]) -> float:
     if action is None or not action.clarifying_question:
         return 0.0
     text = action.clarifying_question.lower()
@@ -70,6 +75,22 @@ def _request_info_quality(action: Action | None, keywords: list[str]) -> float:
     if hits:
         return min(1.0, hits / len(keywords))
     return 0.0
+
+
+def is_substantive_question(text: str | None) -> bool:
+    if not text:
+        return False
+    tokens = _tokenize(text)
+    question_starters = {"can", "could", "would", "what", "which", "when", "where", "why", "how", "did", "is"}
+    return len(tokens) >= 5 and ("?" in text or bool(set(tokens) & question_starters))
+
+
+def request_info_quality(action: Action | None, ground_truth: GroundTruthPayload) -> float:
+    if action is None:
+        return 0.0
+    keyword_score = _request_info_keyword_score(action, ground_truth["clarification_keywords"])
+    substantive_bonus = 1.0 if is_substantive_question(action.clarifying_question) else 0.0
+    return round(0.7 * keyword_score + 0.3 * substantive_bonus, 4)
 
 
 def _keyword_score(text: str | None, keywords: list[str]) -> float:
@@ -82,23 +103,90 @@ def _keyword_score(text: str | None, keywords: list[str]) -> float:
     return min(1.0, hits / len(keywords))
 
 
-def _hard_response_score(response_text: str | None, response_keywords: list[str], history_keywords: list[str]) -> float:
+def _signal_score(text: str | None, signals: list[str]) -> float:
+    if not text:
+        return 0.0
+    lowered = text.lower()
+    hits = sum(1 for signal in signals if signal in lowered)
+    return min(1.0, hits / max(1, len(signals)))
+
+
+def _anti_stuffing_factor(
+    response_text: str | None,
+    response_keywords: list[str],
+    history_keywords: list[str],
+) -> float:
     if not response_text:
         return 0.0
 
-    exact_score = _keyword_score(response_text, response_keywords + history_keywords)
-
-    acknowledgment_signals = ["apolog", "understand", "recogni", "aware", "noted", "received"]
-    timeline_signals = ["day", "hour", "week", "wait", "since", "ago", "delay", "time"]
-    action_signals = ["escalat", "review", "priorit", "team", "follow", "update", "resolve", "process"]
+    tokens = _tokenize(response_text)
+    if not tokens:
+        return 0.0
 
     lowered = response_text.lower()
-    ack_hit = any(signal in lowered for signal in acknowledgment_signals)
-    time_hit = any(signal in lowered for signal in timeline_signals)
-    action_hit = any(signal in lowered for signal in action_signals)
-    semantic_score = (ack_hit + time_hit + action_hit) / 3.0
+    keyword_hits = sum(1 for keyword in response_keywords + history_keywords if keyword.lower() in lowered)
+    unique_ratio = len(set(tokens)) / len(tokens)
+    keyword_density = keyword_hits / len(tokens)
+    sentence_markers = sum(response_text.count(marker) for marker in [".", "!", "?"])
 
-    return round(0.6 * exact_score + 0.4 * semantic_score, 4)
+    factor = 1.0
+    if len(tokens) < 8:
+        factor = min(factor, 0.35)
+    elif len(tokens) < 12:
+        factor = min(factor, 0.6)
+
+    if unique_ratio < 0.5:
+        factor = min(factor, 0.7)
+    if keyword_density > 0.35:
+        factor = min(factor, 0.65)
+    if sentence_markers == 0:
+        factor = min(factor, 0.75)
+
+    return round(factor, 4)
+
+
+def _response_rubric(response_text: str | None, response_keywords: list[str], history_keywords: list[str]) -> dict[str, float]:
+    if not response_text:
+        return {
+            "case_specific_facts": 0.0,
+            "history_acknowledgment": 0.0,
+            "next_step_actionability": 0.0,
+            "tone_acknowledgment": 0.0,
+            "anti_stuffing": 0.0,
+            "response_quality": 0.0,
+        }
+
+    fact_score = _keyword_score(response_text, response_keywords)
+    history_score = _keyword_score(response_text, history_keywords)
+    next_step_score = _signal_score(
+        response_text,
+        ["will", "follow", "update", "review", "escalat", "investigat", "check", "resolve", "today", "next step"],
+    )
+    tone_score = _signal_score(
+        response_text,
+        ["sorry", "apolog", "understand", "recogn", "appreciate", "thanks", "noted", "aware"],
+    )
+    anti_stuffing = _anti_stuffing_factor(response_text, response_keywords, history_keywords)
+    response_quality = round(
+        (0.4 * fact_score + 0.25 * next_step_score + 0.2 * tone_score + 0.15 * history_score) * anti_stuffing,
+        4,
+    )
+    return {
+        "case_specific_facts": round(fact_score, 4),
+        "history_acknowledgment": round(history_score, 4),
+        "next_step_actionability": round(next_step_score, 4),
+        "tone_acknowledgment": round(tone_score, 4),
+        "anti_stuffing": anti_stuffing,
+        "response_quality": response_quality,
+    }
+
+
+def _sequencing_penalty_factor(actions: list[Action], ground_truth: GroundTruthPayload) -> float:
+    if not ground_truth["request_info_first_required"]:
+        return 1.0
+    if actions and actions[0].action_type == "request_info":
+        return 1.0
+    return 0.35
 
 
 def _categorize_score(actions: list[Action], expected_category: str | None) -> float:
@@ -164,11 +252,8 @@ def easy_components(actions: list[Action], ground_truth: GroundTruthPayload) -> 
 
 
 def medium_grader(actions: list[Action], ground_truth: GroundTruthPayload) -> float:
-    if ground_truth["request_info_first_required"]:
-        if not actions or actions[0].action_type != "request_info":
-            return 0.0
     components = medium_components(actions, ground_truth)
-    return round(
+    base_score = round(
         0.2 * components["ambiguity_recognition"]
         + 0.15 * components["clarifying_question_quality"]
         + 0.15 * components["policy_compliance"]
@@ -178,34 +263,37 @@ def medium_grader(actions: list[Action], ground_truth: GroundTruthPayload) -> fl
         + 0.1 * components["fraud_handling"],
         4,
     )
+    return round(base_score * components["sequence_penalty_factor"], 4)
 
 
 def medium_components(actions: list[Action], ground_truth: GroundTruthPayload) -> dict[str, float]:
-    request_info_action = actions[0] if actions and actions[0].action_type == "request_info" else None
+    request_info_action = latest_action(actions, "request_info")
     draft_action = latest_action(actions, "draft_response")
+    response_rubric = _response_rubric(
+        draft_action.response_text if draft_action else None,
+        ground_truth["response_keywords"],
+        ground_truth["history_keywords"],
+    )
     return {
         "ambiguity_recognition": 1.0 if request_info_action else 0.0,
-        "clarifying_question_quality": _request_info_quality(
-            request_info_action,
-            ground_truth["clarification_keywords"],
-        ),
+        "clarifying_question_quality": request_info_quality(request_info_action, ground_truth),
         "policy_compliance": _policy_score(actions, ground_truth),
         "category_correct": _categorize_score(actions, ground_truth["expected_category"]),
         "priority_correct": _priority_score(actions, ground_truth["expected_priority"]),
-        "response_appropriateness": _keyword_score(
-            draft_action.response_text if draft_action else None,
-            ground_truth["response_keywords"],
-        ),
+        "response_appropriateness": response_rubric["response_quality"],
+        "case_specific_facts": response_rubric["case_specific_facts"],
+        "history_acknowledgment": response_rubric["history_acknowledgment"],
+        "next_step_actionability": response_rubric["next_step_actionability"],
+        "tone_acknowledgment": response_rubric["tone_acknowledgment"],
+        "anti_stuffing": response_rubric["anti_stuffing"],
+        "sequence_penalty_factor": _sequencing_penalty_factor(actions, ground_truth),
         "fraud_handling": _fraud_score(actions, bool(ground_truth["expected_flag_fraud"])),
     }
 
 
 def hard_grader(actions: list[Action], ground_truth: GroundTruthPayload) -> float:
-    if ground_truth["request_info_first_required"]:
-        if not actions or actions[0].action_type != "request_info":
-            return 0.0
     components = hard_components(actions, ground_truth)
-    return round(
+    base_score = round(
         0.1 * components["temporal_reasoning"]
         + 0.1 * components["policy_compliance"]
         + 0.1 * components["escalation_accuracy"]
@@ -214,25 +302,38 @@ def hard_grader(actions: list[Action], ground_truth: GroundTruthPayload) -> floa
         + 0.1 * components["fraud_handling"],
         4,
     )
+    return round(base_score * components["sequence_penalty_factor"], 4)
 
 
 def hard_components(actions: list[Action], ground_truth: GroundTruthPayload) -> dict[str, float]:
     draft_action = latest_action(actions, "draft_response")
-    response_text = draft_action.response_text if draft_action else None
-    response_keywords = _keyword_score(response_text, ground_truth["response_keywords"])
-    history_score = _hard_response_score(
-        response_text,
+    response_rubric = _response_rubric(
+        draft_action.response_text if draft_action else None,
         ground_truth["response_keywords"],
         ground_truth["history_keywords"],
     )
     category_score = _categorize_score(actions, ground_truth["expected_category"])
     policy_score = 1.0 if _policy_score(actions, ground_truth) == 1.0 and category_score == 1.0 else 0.0
+    response_completeness = round(
+        (
+            0.45 * response_rubric["case_specific_facts"]
+            + 0.35 * response_rubric["next_step_actionability"]
+            + 0.2 * response_rubric["tone_acknowledgment"]
+        )
+        * response_rubric["anti_stuffing"],
+        4,
+    )
     return {
         "temporal_reasoning": _priority_score(actions, ground_truth["expected_priority"]),
         "policy_compliance": policy_score,
         "escalation_accuracy": _escalation_score(actions, ground_truth["expected_escalation"]),
-        "history_acknowledgment": history_score,
-        "response_completeness": response_keywords,
+        "history_acknowledgment": response_rubric["history_acknowledgment"],
+        "response_completeness": response_completeness,
+        "case_specific_facts": response_rubric["case_specific_facts"],
+        "next_step_actionability": response_rubric["next_step_actionability"],
+        "tone_acknowledgment": response_rubric["tone_acknowledgment"],
+        "anti_stuffing": response_rubric["anti_stuffing"],
+        "sequence_penalty_factor": _sequencing_penalty_factor(actions, ground_truth),
         "fraud_handling": _fraud_score(actions, bool(ground_truth["expected_flag_fraud"])),
     }
 
